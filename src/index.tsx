@@ -60,6 +60,12 @@ async function hashPassword(password: string): Promise<string> {
 // ============================================
 app.get('/api/init-db', async (c) => {
   try {
+    // Drop all tables first to ensure clean state
+    await c.env.DB.prepare('DROP TABLE IF EXISTS activity_log').run()
+    await c.env.DB.prepare('DROP TABLE IF EXISTS document_access').run()
+    await c.env.DB.prepare('DROP TABLE IF EXISTS documents').run()
+    await c.env.DB.prepare('DROP TABLE IF EXISTS users').run()
+
     // Create tables one by one
     await c.env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS users (
@@ -128,9 +134,6 @@ app.get('/api/init-db', async (c) => {
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_activity_log_user ON activity_log(user_id)').run()
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_activity_log_document ON activity_log(document_id)').run()
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)').run()
-
-    // Delete existing users first to avoid duplicates
-    await c.env.DB.prepare('DELETE FROM users').run()
 
     // Insert default users
     const adminHash = await hashPassword('admin123')
