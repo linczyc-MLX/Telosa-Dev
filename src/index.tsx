@@ -10,8 +10,15 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-// Enable CORS
-app.use('/api/*', cors())
+// Enable CORS with proper configuration
+app.use('/api/*', cors({
+  origin: '*',
+  allowHeaders: ['Content-Type', 'Authorization'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  exposeHeaders: ['Content-Length'],
+  maxAge: 600,
+  credentials: true
+}))
 
 // Serve static files
 app.use('/static/*', serveStatic({ root: './public' }))
