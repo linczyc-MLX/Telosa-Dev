@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
-import { sign, verify } from 'hono/jwt'
+import { jwt, sign } from 'hono/jwt'
 
 type Bindings = {
   DB: D1Database
@@ -9,6 +9,9 @@ type Bindings = {
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
+
+// JWT Secret (In production, use environment variable)
+const JWT_SECRET = 'telosa-p4p-secret-key-change-in-production'
 
 // Enable CORS with proper configuration
 app.use('/api/*', cors({
@@ -23,26 +26,16 @@ app.use('/api/*', cors({
 // Serve static files
 app.use('/static/*', serveStatic({ root: './public' }))
 
-// JWT Secret (In production, use environment variable)
-const JWT_SECRET = 'telosa-p4p-secret-key-change-in-production'
+// JWT middleware for protected routes
+const authMiddleware = jwt({
+  secret: JWT_SECRET,
+  alg: 'HS256',
+})
 
-// ============================================
-// Authentication Middleware
-// ============================================
-const authMiddleware = async (c: any, next: any) => {
-  const authHeader = c.req.header('Authorization')
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ error: 'Unauthorized' }, 401)
-  }
-
-  const token = authHeader.substring(7)
-  try {
-    const payload = await verify(token, JWT_SECRET)
-    c.set('user', payload)
-    await next()
-  } catch (error) {
-    return c.json({ error: 'Invalid token' }, 401)
-  }
+// Helper to get user from JWT payload
+function getUser(c: any) {
+  const payload = c.get('jwtPayload')
+  return { id: payload.id, email: payload.email, role: payload.role }
 }
 
 // Simple password hashing (In production, use bcrypt)
@@ -185,7 +178,7 @@ app.post('/api/auth/login', async (c) => {
     id: user.id, 
     email: user.email, 
     role: user.role 
-  }, JWT_SECRET)
+  }, JWT_SECRET, 'HS256')
 
   return c.json({ 
     success: true, 
@@ -219,7 +212,7 @@ app.post('/api/auth/register', async (c) => {
 // API Routes - Documents
 // ============================================
 app.get('/api/documents', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   
   // Get all documents the user can access
   const documents = await c.env.DB.prepare(`
@@ -239,7 +232,7 @@ app.get('/api/documents', authMiddleware, async (c) => {
 
 app.post('/api/documents/upload', authMiddleware, async (c) => {
   try {
-    const user = c.get('user')
+    const user = getUser(c)
     const formData = await c.req.formData()
     
     const file = formData.get('file') as File
@@ -295,7 +288,7 @@ app.post('/api/documents/upload', authMiddleware, async (c) => {
 })
 
 app.get('/api/documents/:id/download', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   const documentId = c.req.param('id')
 
   // Check access permissions
@@ -346,7 +339,7 @@ app.get('/api/documents/:id/download', authMiddleware, async (c) => {
 })
 
 app.delete('/api/documents/:id', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   const documentId = c.req.param('id')
 
   const document = await c.env.DB.prepare(
@@ -380,7 +373,7 @@ app.delete('/api/documents/:id', authMiddleware, async (c) => {
 // API Routes - Document Sharing
 // ============================================
 app.post('/api/documents/:id/share', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   const documentId = c.req.param('id')
   const { userId } = await c.req.json()
 
@@ -414,7 +407,7 @@ app.post('/api/documents/:id/share', authMiddleware, async (c) => {
 // API Routes - Users (Admin only)
 // ============================================
 app.get('/api/users', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
@@ -431,7 +424,7 @@ app.get('/api/users', authMiddleware, async (c) => {
 // API Routes - Activity Log
 // ============================================
 app.get('/api/activity', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   
   let query = 'SELECT al.*, u.name as user_name, d.title as document_title FROM activity_log al LEFT JOIN users u ON al.user_id = u.id LEFT JOIN documents d ON al.document_id = d.id'
   
@@ -455,7 +448,7 @@ app.get('/api/activity', authMiddleware, async (c) => {
 // ============================================
 // Example endpoint to connect to external database
 app.post('/api/external/query', authMiddleware, async (c) => {
-  const user = c.get('user')
+  const user = getUser(c)
   
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
