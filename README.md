@@ -32,6 +32,7 @@ A secure, cloud-based document repository system for the Telosa P4P strategic pl
 
 3. **Document Repository**
    - Upload reports and spreadsheets
+   - **View PDF documents in browser** (opens in new window)
    - Download documents securely
    - Document categorization (Reports, Spreadsheets, Other)
    - File metadata management
@@ -82,7 +83,12 @@ A secure, cloud-based document repository system for the Telosa P4P strategic pl
 
 - **GET /api/documents/:id/download** - Download document
   - Headers: `Authorization: Bearer <token>`
-  - Returns: File binary with appropriate content-type
+  - Returns: File binary with `Content-Disposition: attachment`
+
+- **GET /api/documents/:id/view** - View document in browser
+  - Headers: `Authorization: Bearer <token>`
+  - Returns: File binary with `Content-Disposition: inline`
+  - Opens PDF documents in new browser window/tab
 
 - **DELETE /api/documents/:id** - Delete document (owner/admin only)
   - Headers: `Authorization: Bearer <token>`
@@ -430,9 +436,10 @@ npx wrangler pages secret put IONOS_API_URL --project-name telosa-p4p
 - **Local Sandbox**: http://localhost:3000
 - **Public Sandbox URL**: https://3000-i563he16vbrn1f9bozub2-d0b9e1e2.sandbox.novita.ai
 
-### Production (To be deployed)
-- **Cloudflare Pages**: Will be available at https://telosa-p4p.pages.dev
-- **Custom Domain**: Can be configured after deployment
+### Production
+- **Cloudflare Pages**: https://3168b4d0.telosa-p4p.pages.dev
+- **API Base URL**: https://3168b4d0.telosa-p4p.pages.dev/api
+- **Custom Domain**: Can be configured in Cloudflare dashboard
 
 ## Support & Maintenance
 

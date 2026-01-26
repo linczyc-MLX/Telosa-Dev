@@ -338,6 +338,53 @@ app.get('/api/documents/:id/download', authMiddleware, async (c) => {
   })
 })
 
+app.get('/api/documents/:id/view', authMiddleware, async (c) => {
+  const user = getUser(c)
+  const documentId = c.req.param('id')
+
+  // Check access permissions
+  const document = await c.env.DB.prepare(`
+    SELECT d.*, 
+           (SELECT COUNT(*) FROM document_access WHERE document_id = d.id AND user_id = ?) as has_access
+    FROM documents d
+    WHERE d.id = ?
+  `).bind(user.id, documentId).first()
+
+  if (!document) {
+    return c.json({ error: 'Document not found' }, 404)
+  }
+
+  // Check if user has access
+  const canAccess = document.is_public === 1 || 
+                    document.uploaded_by === user.id || 
+                    document.has_access > 0 || 
+                    user.role === 'admin'
+
+  if (!canAccess) {
+    return c.json({ error: 'Access denied' }, 403)
+  }
+
+  // Get file from R2
+  const file = await c.env.FILES.get(document.file_key as string)
+  if (!file) {
+    return c.json({ error: 'File not found in storage' }, 404)
+  }
+
+  // Log activity
+  await c.env.DB.prepare(
+    'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
+  ).bind(user.id, 'view', documentId, `Viewed ${document.filename}`).run()
+
+  // Return file with inline content disposition to display in browser
+  return new Response(file.body, {
+    headers: {
+      'Content-Type': document.mime_type as string || 'application/pdf',
+      'Content-Disposition': `inline; filename="${document.filename}"`,
+      'Content-Length': file.size.toString()
+    }
+  })
+})
+
 app.delete('/api/documents/:id', authMiddleware, async (c) => {
   const user = getUser(c)
   const documentId = c.req.param('id')

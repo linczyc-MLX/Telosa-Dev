@@ -74,6 +74,10 @@ const api = {
     return response
   },
 
+  getViewUrl(id) {
+    return `${API_BASE}/documents/${id}/view`
+  },
+
   async deleteDocument(id) {
     const response = await axios.delete(`${API_BASE}/documents/${id}`)
     return response.data
@@ -449,6 +453,26 @@ async function handleDownload(id, filename) {
   }
 }
 
+async function handleView(id) {
+  try {
+    // Create a temporary link that opens in a new window
+    // The axios interceptor will automatically add the Authorization header
+    const response = await axios.get(`${API_BASE}/documents/${id}/view`, {
+      responseType: 'blob'
+    })
+    
+    // Create a blob URL and open it in a new window
+    const blob = new Blob([response.data], { type: response.headers['content-type'] || 'application/pdf' })
+    const url = window.URL.createObjectURL(blob)
+    window.open(url, '_blank')
+    
+    // Clean up the blob URL after a delay
+    setTimeout(() => window.URL.revokeObjectURL(url), 100)
+  } catch (error) {
+    alert(error.response?.data?.error || 'View failed')
+  }
+}
+
 async function handleDelete(id) {
   if (!confirm('Are you sure you want to delete this document?')) return
 
@@ -554,6 +578,13 @@ function renderDocumentsList() {
             <td class="px-6 py-4 text-sm text-gray-500">${new Date(doc.uploaded_at).toLocaleDateString()}</td>
             <td class="px-6 py-4 text-sm text-gray-500">${doc.download_count}</td>
             <td class="px-6 py-4 text-sm space-x-2">
+              <button 
+                onclick="handleView(${doc.id})"
+                class="text-purple-600 hover:text-purple-800"
+                title="View"
+              >
+                <i class="fas fa-eye"></i>
+              </button>
               <button 
                 onclick="handleDownload(${doc.id}, '${doc.filename}')"
                 class="text-blue-600 hover:text-blue-800"
@@ -672,12 +703,20 @@ function updateDashboardStats() {
               <p class="font-medium text-gray-900">${doc.title}</p>
               <p class="text-sm text-gray-500">${doc.uploader_name} • ${new Date(doc.uploaded_at).toLocaleDateString()}</p>
             </div>
-            <button 
-              onclick="handleDownload(${doc.id}, '${doc.filename}')"
-              class="px-3 py-1 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
-            >
-              Download
-            </button>
+            <div class="flex space-x-2">
+              <button 
+                onclick="handleView(${doc.id})"
+                class="px-3 py-1 bg-purple-600 text-white text-sm rounded hover:bg-purple-700"
+              >
+                <i class="fas fa-eye mr-1"></i>View
+              </button>
+              <button 
+                onclick="handleDownload(${doc.id}, '${doc.filename}')"
+                class="px-3 py-1 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
+              >
+                <i class="fas fa-download mr-1"></i>Download
+              </button>
+            </div>
           </div>
         `).join('')}
       </div>
