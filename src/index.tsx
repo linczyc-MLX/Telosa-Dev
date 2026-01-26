@@ -129,21 +129,24 @@ app.get('/api/init-db', async (c) => {
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_activity_log_document ON activity_log(document_id)').run()
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)').run()
 
+    // Delete existing users first to avoid duplicates
+    await c.env.DB.prepare('DELETE FROM users').run()
+
     // Insert default users
     const adminHash = await hashPassword('admin123')
     await c.env.DB.prepare(
-      'INSERT OR IGNORE INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
+      'INSERT INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
     ).bind(1, 'admin@telosap4p.com', adminHash, 'Admin User', 'admin').run()
 
     await c.env.DB.prepare(
-      'INSERT OR IGNORE INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
+      'INSERT INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
     ).bind(2, 'member@telosap4p.com', adminHash, 'John Doe', 'member').run()
 
     await c.env.DB.prepare(
-      'INSERT OR IGNORE INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
+      'INSERT INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
     ).bind(3, 'analyst@telosap4p.com', adminHash, 'Jane Smith', 'member').run()
 
-    return c.json({ success: true, message: 'Database initialized successfully' })
+    return c.json({ success: true, message: 'Database initialized successfully', hash: adminHash })
   } catch (error: any) {
     return c.json({ success: false, error: error.message }, 500)
   }
