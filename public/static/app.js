@@ -5,13 +5,19 @@ const API_BASE = '/api'
 let authToken = localStorage.getItem('authToken')
 let currentUser = JSON.parse(localStorage.getItem('currentUser') || 'null')
 
-// Axios interceptor for authentication
-axios.interceptors.request.use(config => {
-  if (authToken) {
-    config.headers.Authorization = `Bearer ${authToken}`
-  }
-  return config
-})
+// Setup axios interceptor
+function setupAxiosInterceptor() {
+  axios.interceptors.request.use(config => {
+    const token = localStorage.getItem('authToken')
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`
+    }
+    return config
+  })
+}
+
+// Initialize interceptor
+setupAxiosInterceptor()
 
 // ============================================
 // State Management
