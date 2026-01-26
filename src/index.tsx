@@ -238,55 +238,60 @@ app.get('/api/documents', authMiddleware, async (c) => {
 })
 
 app.post('/api/documents/upload', authMiddleware, async (c) => {
-  const user = c.get('user')
-  const formData = await c.req.formData()
-  
-  const file = formData.get('file') as File
-  const title = formData.get('title') as string
-  const description = formData.get('description') as string
-  const fileType = formData.get('fileType') as string
-  const isPublic = formData.get('isPublic') === 'true'
+  try {
+    const user = c.get('user')
+    const formData = await c.req.formData()
+    
+    const file = formData.get('file') as File
+    const title = formData.get('title') as string
+    const description = formData.get('description') as string
+    const fileType = formData.get('fileType') as string
+    const isPublic = formData.get('isPublic') === 'true'
 
-  if (!file) {
-    return c.json({ error: 'No file provided' }, 400)
-  }
-
-  // Generate unique file key
-  const fileKey = `uploads/${Date.now()}-${file.name}`
-  
-  // Upload to R2
-  await c.env.FILES.put(fileKey, file.stream(), {
-    httpMetadata: {
-      contentType: file.type
+    if (!file) {
+      return c.json({ error: 'No file provided' }, 400)
     }
-  })
 
-  // Save metadata to database
-  const result = await c.env.DB.prepare(`
-    INSERT INTO documents (title, description, filename, file_key, file_type, mime_type, file_size, uploaded_by, is_public)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    title || file.name,
-    description || '',
-    file.name,
-    fileKey,
-    fileType || 'other',
-    file.type,
-    file.size,
-    user.id,
-    isPublic ? 1 : 0
-  ).run()
+    // Generate unique file key
+    const fileKey = `uploads/${Date.now()}-${file.name}`
+    
+    // Upload to R2
+    await c.env.FILES.put(fileKey, file.stream(), {
+      httpMetadata: {
+        contentType: file.type
+      }
+    })
 
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
-  ).bind(user.id, 'upload', result.meta.last_row_id, `Uploaded ${file.name}`).run()
+    // Save metadata to database
+    const result = await c.env.DB.prepare(`
+      INSERT INTO documents (title, description, filename, file_key, file_type, mime_type, file_size, uploaded_by, is_public)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      title || file.name,
+      description || '',
+      file.name,
+      fileKey,
+      fileType || 'other',
+      file.type,
+      file.size,
+      user.id,
+      isPublic ? 1 : 0
+    ).run()
 
-  return c.json({ 
-    success: true, 
-    documentId: result.meta.last_row_id,
-    fileKey: fileKey
-  })
+    // Log activity
+    await c.env.DB.prepare(
+      'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
+    ).bind(user.id, 'upload', result.meta.last_row_id, `Uploaded ${file.name}`).run()
+
+    return c.json({ 
+      success: true, 
+      documentId: result.meta.last_row_id,
+      fileKey: fileKey
+    })
+  } catch (error: any) {
+    console.error('Upload error:', error)
+    return c.json({ error: error.message || 'Upload failed' }, 500)
+  }
 })
 
 app.get('/api/documents/:id/download', authMiddleware, async (c) => {
