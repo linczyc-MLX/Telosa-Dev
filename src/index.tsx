@@ -1,6 +1,5 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { serveStatic } from 'hono/cloudflare-workers'
 import { jwt, sign } from 'hono/jwt'
 
 type Bindings = {
@@ -23,8 +22,8 @@ app.use('/api/*', cors({
   credentials: true
 }))
 
-// Serve static assets from Cloudflare Pages
-app.use('/static/*', serveStatic({ root: './' }))
+// Static assets are served automatically by Cloudflare Pages from dist/
+// No need for serveStatic middleware
 
 // JWT middleware for protected routes
 const authMiddleware = jwt({
