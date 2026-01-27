@@ -25,6 +25,17 @@ app.use('/api/*', cors({
 // Static assets are served automatically by Cloudflare Pages from dist/
 // No need for serveStatic middleware
 
+// Serve app.js 
+app.get('/static/app.js', async (c) => {
+  // In production, Cloudflare Pages will serve this from dist/app.js
+  // We redirect to the root file
+  return c.redirect('/app.js', 301)
+})
+
+app.get('/static/style.css', async (c) => {
+  return c.redirect('/style.css', 301)
+})
+
 // JWT middleware for protected routes
 const authMiddleware = jwt({
   secret: JWT_SECRET,
