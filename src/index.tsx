@@ -23,8 +23,8 @@ app.use('/api/*', cors({
   credentials: true
 }))
 
-// Serve static files
-app.use('/static/*', serveStatic({ root: './public' }))
+// Serve static assets from Cloudflare Pages
+app.use('/static/*', serveStatic({ root: './' }))
 
 // JWT middleware for protected routes
 const authMiddleware = jwt({

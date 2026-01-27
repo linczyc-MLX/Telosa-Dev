@@ -20,5 +20,11 @@
       "binding": "FILES",
       "bucket_name": "telosa-p4p-files"
     }
-  ]
+  ],
+  
+  // Ensure static assets are included
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS"
+  }
 }
