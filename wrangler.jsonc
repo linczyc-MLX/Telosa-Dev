@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "telosa-p4p-production",
-      "database_id": "" // Will be set after creating the database
+      "database_id": "bb5cbb88-b921-4f83-8c6f-01c975b8185b"
     }
   ],
   
