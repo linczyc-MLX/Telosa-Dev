@@ -63,13 +63,20 @@ async function hashPassword(password: string): Promise<string> {
 // ============================================
 app.get('/api/init-db', async (c) => {
   try {
-    // Drop all tables first to ensure clean state
-    await c.env.DB.prepare('DROP TABLE IF EXISTS activity_log').run()
-    await c.env.DB.prepare('DROP TABLE IF EXISTS document_access').run()
-    await c.env.DB.prepare('DROP TABLE IF EXISTS documents').run()
-    await c.env.DB.prepare('DROP TABLE IF EXISTS users').run()
+    // Check if users table already exists
+    const tableCheck = await c.env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+    ).first()
 
-    // Create tables one by one
+    if (tableCheck) {
+      return c.json({ 
+        success: true, 
+        message: 'Database already initialized. Tables exist and data is preserved.',
+        existingTables: true 
+      })
+    }
+
+    // Only create tables if they don't exist (first-time setup)
     await c.env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,7 +159,7 @@ app.get('/api/init-db', async (c) => {
       'INSERT INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
     ).bind(3, 'analyst@telosap4p.com', adminHash, 'Jane Smith', 'member').run()
 
-    return c.json({ success: true, message: 'Database initialized successfully', hash: adminHash })
+    return c.json({ success: true, message: 'Database initialized successfully - first time setup complete', hash: adminHash })
   } catch (error: any) {
     return c.json({ success: false, error: error.message }, 500)
   }
