@@ -477,6 +477,149 @@ app.get('/api/users', authMiddleware, async (c) => {
   return c.json({ users: users.results })
 })
 
+// Create new user (Admin only)
+app.post('/api/users', authMiddleware, async (c) => {
+  const user = getUser(c)
+  
+  if (user.role !== 'admin') {
+    return c.json({ error: 'Admin access required' }, 403)
+  }
+
+  const { email, password, name, role } = await c.req.json()
+
+  // Validate required fields
+  if (!email || !password || !name) {
+    return c.json({ error: 'Email, password, and name are required' }, 400)
+  }
+
+  // Check if user already exists
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM users WHERE email = ?'
+  ).bind(email).first()
+
+  if (existing) {
+    return c.json({ error: 'Email already registered' }, 400)
+  }
+
+  const passwordHash = await hashPassword(password)
+  
+  const result = await c.env.DB.prepare(
+    'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)'
+  ).bind(email, passwordHash, name, role || 'member').run()
+
+  // Log activity
+  await c.env.DB.prepare(
+    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
+  ).bind(user.id, 'user_create', `Created user ${email}`).run()
+
+  return c.json({ success: true, userId: result.meta.last_row_id })
+})
+
+// Update user (Admin only)
+app.put('/api/users/:id', authMiddleware, async (c) => {
+  const user = getUser(c)
+  const userId = c.req.param('id')
+  
+  if (user.role !== 'admin') {
+    return c.json({ error: 'Admin access required' }, 403)
+  }
+
+  const { email, name, role, password } = await c.req.json()
+
+  // Check if user exists
+  const existingUser = await c.env.DB.prepare(
+    'SELECT id FROM users WHERE id = ?'
+  ).bind(userId).first()
+
+  if (!existingUser) {
+    return c.json({ error: 'User not found' }, 404)
+  }
+
+  // Check if email is already used by another user
+  if (email) {
+    const emailCheck = await c.env.DB.prepare(
+      'SELECT id FROM users WHERE email = ? AND id != ?'
+    ).bind(email, userId).first()
+
+    if (emailCheck) {
+      return c.json({ error: 'Email already in use' }, 400)
+    }
+  }
+
+  // Build update query dynamically based on provided fields
+  const updates: string[] = []
+  const bindings: any[] = []
+
+  if (email) {
+    updates.push('email = ?')
+    bindings.push(email)
+  }
+  if (name) {
+    updates.push('name = ?')
+    bindings.push(name)
+  }
+  if (role) {
+    updates.push('role = ?')
+    bindings.push(role)
+  }
+  if (password) {
+    const passwordHash = await hashPassword(password)
+    updates.push('password_hash = ?')
+    bindings.push(passwordHash)
+  }
+
+  if (updates.length === 0) {
+    return c.json({ error: 'No fields to update' }, 400)
+  }
+
+  bindings.push(userId)
+
+  await c.env.DB.prepare(
+    `UPDATE users SET ${updates.join(', ')} WHERE id = ?`
+  ).bind(...bindings).run()
+
+  // Log activity
+  await c.env.DB.prepare(
+    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
+  ).bind(user.id, 'user_update', `Updated user ${userId}`).run()
+
+  return c.json({ success: true })
+})
+
+// Delete user (Admin only)
+app.delete('/api/users/:id', authMiddleware, async (c) => {
+  const user = getUser(c)
+  const userId = c.req.param('id')
+  
+  if (user.role !== 'admin') {
+    return c.json({ error: 'Admin access required' }, 403)
+  }
+
+  // Prevent admin from deleting themselves
+  if (parseInt(userId) === user.id) {
+    return c.json({ error: 'Cannot delete your own account' }, 400)
+  }
+
+  // Check if user exists
+  const existingUser = await c.env.DB.prepare(
+    'SELECT id, email FROM users WHERE id = ?'
+  ).bind(userId).first()
+
+  if (!existingUser) {
+    return c.json({ error: 'User not found' }, 404)
+  }
+
+  // Delete user (CASCADE will handle related records)
+  await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run()
+
+  // Log activity
+  await c.env.DB.prepare(
+    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
+  ).bind(user.id, 'user_delete', `Deleted user ${existingUser.email}`).run()
+
+  return c.json({ success: true })
+})
+
 // ============================================
 // API Routes - Activity Log
 // ============================================

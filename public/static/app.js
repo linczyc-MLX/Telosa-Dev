@@ -93,6 +93,21 @@ const api = {
     return response.data.users
   },
 
+  async createUser(email, password, name, role) {
+    const response = await axios.post(`${API_BASE}/users`, { email, password, name, role })
+    return response.data
+  },
+
+  async updateUser(id, updates) {
+    const response = await axios.put(`${API_BASE}/users/${id}`, updates)
+    return response.data
+  },
+
+  async deleteUser(id) {
+    const response = await axios.delete(`${API_BASE}/users/${id}`)
+    return response.data
+  },
+
   async getActivities() {
     const response = await axios.get(`${API_BASE}/activity`)
     return response.data.activities
@@ -498,6 +513,154 @@ async function handleShare(documentId) {
 }
 
 // ============================================
+// User Management Functions
+// ============================================
+function showAddUserModal() {
+  const modal = document.createElement('div')
+  modal.id = 'userModal'
+  modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50'
+  modal.innerHTML = `
+    <div class="bg-white rounded-lg p-6 w-full max-w-md">
+      <h2 class="text-2xl font-bold mb-4">Add New User</h2>
+      <form onsubmit="handleCreateUser(event)" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Name</label>
+          <input type="text" id="userName" required class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+          <input type="email" id="userEmail" required class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+          <input type="password" id="userPassword" required minlength="6" class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Role</label>
+          <select id="userRole" class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+            <option value="member">Member</option>
+            <option value="admin">Admin</option>
+          </select>
+        </div>
+        <div class="flex space-x-3">
+          <button type="submit" class="flex-1 bg-blue-600 text-white py-2 rounded hover:bg-blue-700">
+            Create User
+          </button>
+          <button type="button" onclick="closeModal()" class="flex-1 bg-gray-300 text-gray-700 py-2 rounded hover:bg-gray-400">
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  `
+  document.body.appendChild(modal)
+}
+
+function showEditUserModal(userId) {
+  const user = state.users.find(u => u.id === userId)
+  if (!user) return
+
+  const modal = document.createElement('div')
+  modal.id = 'userModal'
+  modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50'
+  modal.innerHTML = `
+    <div class="bg-white rounded-lg p-6 w-full max-w-md">
+      <h2 class="text-2xl font-bold mb-4">Edit User</h2>
+      <form onsubmit="handleUpdateUser(event, ${userId})" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Name</label>
+          <input type="text" id="userName" value="${user.name}" required class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+          <input type="email" id="userEmail" value="${user.email}" required class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">New Password (leave blank to keep current)</label>
+          <input type="password" id="userPassword" minlength="6" class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Role</label>
+          <select id="userRole" class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500">
+            <option value="member" ${user.role === 'member' ? 'selected' : ''}>Member</option>
+            <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin</option>
+          </select>
+        </div>
+        <div class="flex space-x-3">
+          <button type="submit" class="flex-1 bg-blue-600 text-white py-2 rounded hover:bg-blue-700">
+            Update User
+          </button>
+          <button type="button" onclick="closeModal()" class="flex-1 bg-gray-300 text-gray-700 py-2 rounded hover:bg-gray-400">
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  `
+  document.body.appendChild(modal)
+}
+
+async function handleCreateUser(event) {
+  event.preventDefault()
+  
+  const name = document.getElementById('userName').value
+  const email = document.getElementById('userEmail').value
+  const password = document.getElementById('userPassword').value
+  const role = document.getElementById('userRole').value
+
+  try {
+    await api.createUser(email, password, name, role)
+    alert('User created successfully!')
+    closeModal()
+    loadUsers()
+  } catch (error) {
+    alert(error.response?.data?.error || 'Failed to create user')
+  }
+}
+
+async function handleUpdateUser(event, userId) {
+  event.preventDefault()
+  
+  const name = document.getElementById('userName').value
+  const email = document.getElementById('userEmail').value
+  const password = document.getElementById('userPassword').value
+  const role = document.getElementById('userRole').value
+
+  const updates = { name, email, role }
+  if (password) {
+    updates.password = password
+  }
+
+  try {
+    await api.updateUser(userId, updates)
+    alert('User updated successfully!')
+    closeModal()
+    loadUsers()
+  } catch (error) {
+    alert(error.response?.data?.error || 'Failed to update user')
+  }
+}
+
+async function handleDeleteUser(userId, userEmail) {
+  if (!confirm(`Are you sure you want to delete user "${userEmail}"? This action cannot be undone.`)) return
+
+  try {
+    await api.deleteUser(userId)
+    alert('User deleted successfully!')
+    loadUsers()
+  } catch (error) {
+    alert(error.response?.data?.error || 'Failed to delete user')
+  }
+}
+
+function closeModal() {
+  const modal = document.getElementById('userModal')
+  if (modal) {
+    modal.remove()
+  }
+}
+
+// ============================================
 // Data Loading Functions
 // ============================================
 async function loadDocuments() {
@@ -621,6 +784,11 @@ function renderUsersList() {
   if (!container) return
 
   container.innerHTML = `
+    <div class="mb-4">
+      <button onclick="showAddUserModal()" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+        <i class="fas fa-user-plus mr-2"></i>Add User
+      </button>
+    </div>
     <table class="w-full">
       <thead class="bg-gray-50">
         <tr>
@@ -629,6 +797,7 @@ function renderUsersList() {
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Email</th>
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last Login</th>
+          <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-gray-200">
@@ -646,6 +815,16 @@ function renderUsersList() {
             </td>
             <td class="px-6 py-4 text-sm text-gray-500">
               ${user.last_login ? new Date(user.last_login).toLocaleString() : 'Never'}
+            </td>
+            <td class="px-6 py-4 text-sm space-x-2">
+              <button onclick="showEditUserModal(${user.id})" class="text-blue-600 hover:text-blue-800">
+                <i class="fas fa-edit"></i> Edit
+              </button>
+              ${user.id !== currentUser.id ? `
+                <button onclick="handleDeleteUser(${user.id}, '${user.email}')" class="text-red-600 hover:text-red-800">
+                  <i class="fas fa-trash"></i> Delete
+                </button>
+              ` : ''}
             </td>
           </tr>
         `).join('')}
