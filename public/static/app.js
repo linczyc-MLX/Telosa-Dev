@@ -803,14 +803,14 @@ function renderDocumentsList() {
               >
                 <i class="fas fa-download"></i>
               </button>
-              ${(doc.uploaded_by === currentUser.id || currentUser.role === 'admin') ? `
-                <button 
-                  onclick="handleShare(${doc.id})"
-                  class="text-green-600 hover:text-green-800"
-                  title="Share"
-                >
-                  <i class="fas fa-share"></i>
-                </button>
+              <button 
+                onclick="handleShare(${doc.id})"
+                class="text-green-600 hover:text-green-800"
+                title="Share"
+              >
+                <i class="fas fa-share"></i>
+              </button>
+              ${currentUser.role === 'admin' ? `
                 <button 
                   onclick="handleDelete(${doc.id})"
                   class="text-red-600 hover:text-red-800"
