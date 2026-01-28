@@ -25,6 +25,6 @@
   // Ensure static assets are included
   "assets": {
     "directory": "./dist",
-    "binding": "ASSETS"
+    "binding": "STATIC_ASSETS"
   }
 }
