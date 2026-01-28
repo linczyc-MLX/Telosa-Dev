@@ -25,13 +25,10 @@ app.use('/api/*', cors({
 // Static assets are served automatically by Cloudflare Pages from dist/
 // No need for serveStatic middleware
 
-// Serve app.js 
+// Serve app.js and style.css with redirects (for Vite build)
 app.get('/static/app.js', async (c) => {
-  // In production, Cloudflare Pages will serve this from dist/app.js
-  // We redirect to the root file
   return c.redirect('/app.js', 301)
 })
-
 app.get('/static/style.css', async (c) => {
   return c.redirect('/style.css', 301)
 })
@@ -58,9 +55,9 @@ async function hashPassword(password: string): Promise<string> {
     .join('')
 }
 
-// ============================================
+// ==================================================
 // Database Initialization
-// ============================================
+// ==================================================
 app.get('/api/init-db', async (c) => {
   try {
     // Check if users table already exists
@@ -69,10 +66,10 @@ app.get('/api/init-db', async (c) => {
     ).first()
 
     if (tableCheck) {
-      return c.json({ 
-        success: true, 
+      return c.json({
+        success: true,
         message: 'Database already initialized. Tables exist and data is preserved.',
-        existingTables: true 
+        existingTables: true
       })
     }
 
@@ -136,7 +133,7 @@ app.get('/api/init-db', async (c) => {
       )
     `).run()
 
-    // Create indexes
+    // Create indexes to speed up queries
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_documents_uploaded_by ON documents(uploaded_by)').run()
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_documents_file_type ON documents(file_type)').run()
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_document_access_document ON document_access(document_id)').run()
@@ -145,7 +142,7 @@ app.get('/api/init-db', async (c) => {
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_activity_log_document ON activity_log(document_id)').run()
     await c.env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)').run()
 
-    // Insert default users
+    // Insert default users (admin and two members)
     const adminHash = await hashPassword('admin123')
     await c.env.DB.prepare(
       'INSERT INTO users (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, ?)'
@@ -165,14 +162,14 @@ app.get('/api/init-db', async (c) => {
   }
 })
 
-// ============================================
-// API Routes - Authentication
-// ============================================
+// ==================================================
+// API Routes – Authentication
+// ==================================================
 app.post('/api/auth/login', async (c) => {
   const { email, password } = await c.req.json()
-  
+
   const passwordHash = await hashPassword(password)
-  // Search by EITHER email OR name to allow flexible login
+  // Search by email OR name to allow flexible login
   const user = await c.env.DB.prepare(
     'SELECT id, email, name, role FROM users WHERE (email = ? OR name = ?) AND password_hash = ?'
   ).bind(email, email, passwordHash).first()
@@ -192,22 +189,22 @@ app.post('/api/auth/login', async (c) => {
   ).bind(user.id, 'login', `User logged in from ${c.req.header('cf-connecting-ip') || 'unknown'}`).run()
 
   // Create JWT token
-  const token = await sign({ 
-    id: user.id, 
-    email: user.email, 
-    role: user.role 
+  const token = await sign({
+    id: user.id,
+    email: user.email,
+    role: user.role
   }, JWT_SECRET, 'HS256')
 
-  return c.json({ 
-    success: true, 
-    token, 
-    user: { id: user.id, email: user.email, name: user.name, role: user.role } 
+  return c.json({
+    success: true,
+    token,
+    user: { id: user.id, email: user.email, name: user.name, role: user.role }
   })
 })
 
 app.post('/api/auth/register', async (c) => {
   const { email, password, name } = await c.req.json()
-  
+
   // Check if user already exists
   const existing = await c.env.DB.prepare(
     'SELECT id FROM users WHERE email = ?'
@@ -218,7 +215,7 @@ app.post('/api/auth/register', async (c) => {
   }
 
   const passwordHash = await hashPassword(password)
-  
+
   const result = await c.env.DB.prepare(
     'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)'
   ).bind(email, passwordHash, name, 'member').run()
@@ -226,19 +223,19 @@ app.post('/api/auth/register', async (c) => {
   return c.json({ success: true, userId: result.meta.last_row_id })
 })
 
-// ============================================
-// API Routes - Documents
-// ============================================
+// ==================================================
+// API Routes – Documents
+// ==================================================
 app.get('/api/documents', authMiddleware, async (c) => {
   const user = getUser(c)
-  
+
   // Get all documents the user can access
   const documents = await c.env.DB.prepare(`
     SELECT DISTINCT d.*, u.name as uploader_name
     FROM documents d
     LEFT JOIN users u ON d.uploaded_by = u.id
     LEFT JOIN document_access da ON d.id = da.document_id
-    WHERE d.is_public = 1 
+    WHERE d.is_public = 1
        OR d.uploaded_by = ?
        OR da.user_id = ?
        OR ? = 'admin'
@@ -252,7 +249,7 @@ app.post('/api/documents/upload', authMiddleware, async (c) => {
   try {
     const user = getUser(c)
     const formData = await c.req.formData()
-    
+
     const file = formData.get('file') as File
     const title = formData.get('title') as string
     const description = formData.get('description') as string
@@ -265,7 +262,7 @@ app.post('/api/documents/upload', authMiddleware, async (c) => {
 
     // Generate unique file key
     const fileKey = `uploads/${Date.now()}-${file.name}`
-    
+
     // Upload to R2
     await c.env.FILES.put(fileKey, file.stream(), {
       httpMetadata: {
@@ -294,8 +291,8 @@ app.post('/api/documents/upload', authMiddleware, async (c) => {
       'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
     ).bind(user.id, 'upload', result.meta.last_row_id, `Uploaded ${file.name}`).run()
 
-    return c.json({ 
-      success: true, 
+    return c.json({
+      success: true,
       documentId: result.meta.last_row_id,
       fileKey: fileKey
     })
@@ -311,7 +308,7 @@ app.get('/api/documents/:id/download', authMiddleware, async (c) => {
 
   // Check access permissions
   const document = await c.env.DB.prepare(`
-    SELECT d.*, 
+    SELECT d.*,
            (SELECT COUNT(*) FROM document_access WHERE document_id = d.id AND user_id = ?) as has_access
     FROM documents d
     WHERE d.id = ?
@@ -322,9 +319,9 @@ app.get('/api/documents/:id/download', authMiddleware, async (c) => {
   }
 
   // Check if user has access
-  const canAccess = document.is_public === 1 || 
-                    document.uploaded_by === user.id || 
-                    document.has_access > 0 || 
+  const canAccess = document.is_public === 1 ||
+                    document.uploaded_by === user.id ||
+                    document.has_access > 0 ||
                     user.role === 'admin'
 
   if (!canAccess) {
@@ -362,7 +359,7 @@ app.get('/api/documents/:id/view', authMiddleware, async (c) => {
 
   // Check access permissions
   const document = await c.env.DB.prepare(`
-    SELECT d.*, 
+    SELECT d.*,
            (SELECT COUNT(*) FROM document_access WHERE document_id = d.id AND user_id = ?) as has_access
     FROM documents d
     WHERE d.id = ?
@@ -373,9 +370,9 @@ app.get('/api/documents/:id/view', authMiddleware, async (c) => {
   }
 
   // Check if user has access
-  const canAccess = document.is_public === 1 || 
-                    document.uploaded_by === user.id || 
-                    document.has_access > 0 || 
+  const canAccess = document.is_public === 1 ||
+                    document.uploaded_by === user.id ||
+                    document.has_access > 0 ||
                     user.role === 'admin'
 
   if (!canAccess) {
@@ -434,9 +431,11 @@ app.delete('/api/documents/:id', authMiddleware, async (c) => {
   return c.json({ success: true })
 })
 
-// ============================================
-// API Routes - Document Sharing
-// ============================================
+// ==================================================
+// API Routes – Document Sharing
+// ==================================================
+
+// Share by user ID (any authenticated user can share)
 app.post('/api/documents/:id/share', authMiddleware, async (c) => {
   const user = getUser(c)
   const documentId = c.req.param('id')
@@ -450,8 +449,7 @@ app.post('/api/documents/:id/share', authMiddleware, async (c) => {
     return c.json({ error: 'Document not found' }, 404)
   }
 
-  // Anyone can share documents
-  // No access check needed - sharing is a collaborative feature
+  // Anyone can share documents — no access check needed
 
   // Grant access
   await c.env.DB.prepare(
@@ -466,12 +464,18 @@ app.post('/api/documents/:id/share', authMiddleware, async (c) => {
   return c.json({ success: true })
 })
 
-// Share document by email (Anyone can use)
+// Share document by email (create user if necessary)
 app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
   const user = getUser(c)
   const documentId = c.req.param('id')
   const { email } = await c.req.json()
 
+  // Sanity check
+  if (!email || !email.includes('@')) {
+    return c.json({ error: 'Invalid email address' }, 400)
+  }
+
+  // Verify document exists
   const document = await c.env.DB.prepare(
     'SELECT * FROM documents WHERE id = ?'
   ).bind(documentId).first()
@@ -480,13 +484,20 @@ app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
     return c.json({ error: 'Document not found' }, 404)
   }
 
-  // Look up user by email
-  const targetUser = await c.env.DB.prepare(
+  // Look up user by email; if not found, create a new member user
+  let targetUser = await c.env.DB.prepare(
     'SELECT id, name FROM users WHERE email = ?'
   ).bind(email).first()
 
   if (!targetUser) {
-    return c.json({ error: 'User not found' }, 404)
+    // Create a simple name from the email (portion before @)
+    const name = email.split('@')[0]
+    // Set a default password; in a real system you'd want to send a password‑reset or invite email
+    const defaultPasswordHash = await hashPassword('changeme')
+    const insert = await c.env.DB.prepare(
+      'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)'
+    ).bind(email, defaultPasswordHash, name, 'member').run()
+    targetUser = { id: insert.meta.last_row_id, name }
   }
 
   // Grant access
@@ -497,17 +508,20 @@ app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
   // Log activity
   await c.env.DB.prepare(
     'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
-  ).bind(user.id, 'share', documentId, `Shared with ${targetUser.name} (${email})`).run()
+  ).bind(user.id, 'share', documentId, `Shared with ${email}`).run()
 
-  return c.json({ success: true })
+  // NOTE: This implementation does not actually send an email. To notify the recipient,
+  // integrate with an SMTP or email service here (e.g. MailChannels or SendGrid).
+
+  return c.json({ success: true, message: `Access granted to ${email}` })
 })
 
-// ============================================
-// API Routes - Users (Admin only)
-// ============================================
+// ==================================================
+// API Routes – Users (Admin only)
+// ==================================================
 app.get('/api/users', authMiddleware, async (c) => {
   const user = getUser(c)
-  
+
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
   }
@@ -522,7 +536,7 @@ app.get('/api/users', authMiddleware, async (c) => {
 // Create new user (Admin only)
 app.post('/api/users', authMiddleware, async (c) => {
   const user = getUser(c)
-  
+
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
   }
@@ -544,7 +558,7 @@ app.post('/api/users', authMiddleware, async (c) => {
   }
 
   const passwordHash = await hashPassword(password)
-  
+
   const result = await c.env.DB.prepare(
     'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)'
   ).bind(email, passwordHash, name, role || 'member').run()
@@ -561,7 +575,7 @@ app.post('/api/users', authMiddleware, async (c) => {
 app.put('/api/users/:id', authMiddleware, async (c) => {
   const user = getUser(c)
   const userId = c.req.param('id')
-  
+
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
   }
@@ -588,7 +602,7 @@ app.put('/api/users/:id', authMiddleware, async (c) => {
     }
   }
 
-  // Build update query dynamically based on provided fields
+  // Build update query dynamically
   const updates: string[] = []
   const bindings: any[] = []
 
@@ -632,7 +646,7 @@ app.put('/api/users/:id', authMiddleware, async (c) => {
 app.delete('/api/users/:id', authMiddleware, async (c) => {
   const user = getUser(c)
   const userId = c.req.param('id')
-  
+
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
   }
@@ -662,21 +676,21 @@ app.delete('/api/users/:id', authMiddleware, async (c) => {
   return c.json({ success: true })
 })
 
-// ============================================
-// API Routes - Activity Log
-// ============================================
+// ==================================================
+// API Routes – Activity Log
+// ==================================================
 app.get('/api/activity', authMiddleware, async (c) => {
   const user = getUser(c)
-  
+
   let query = 'SELECT al.*, u.name as user_name, d.title as document_title FROM activity_log al LEFT JOIN users u ON al.user_id = u.id LEFT JOIN documents d ON al.document_id = d.id'
-  
+
   if (user.role === 'admin') {
     query += ' ORDER BY al.created_at DESC LIMIT 100'
   } else {
     query += ' WHERE al.user_id = ? ORDER BY al.created_at DESC LIMIT 50'
   }
 
-  const stmt = user.role === 'admin' 
+  const stmt = user.role === 'admin'
     ? c.env.DB.prepare(query)
     : c.env.DB.prepare(query).bind(user.id)
 
@@ -685,42 +699,29 @@ app.get('/api/activity', authMiddleware, async (c) => {
   return c.json({ activities: logs.results })
 })
 
-// ============================================
-// API Routes - IONOS VPS Database Integration
-// ============================================
-// Example endpoint to connect to external database
+// ==================================================
+// API Routes – External Database (Placeholder)
+// ==================================================
 app.post('/api/external/query', authMiddleware, async (c) => {
   const user = getUser(c)
-  
+
   if (user.role !== 'admin') {
     return c.json({ error: 'Admin access required' }, 403)
   }
 
   const { query, params } = await c.req.json()
 
-  // This is where you would connect to your IONOS VPS database
-  // You'll need to create an API endpoint on your IONOS server
-  // that accepts authenticated requests and executes queries
-  
-  // Example:
-  // const response = await fetch('https://your-ionos-server.com/api/query', {
-  //   method: 'POST',
-  //   headers: {
-  //     'Content-Type': 'application/json',
-  //     'Authorization': 'Bearer YOUR_IONOS_API_KEY'
-  //   },
-  //   body: JSON.stringify({ query, params })
-  // })
-  
-  return c.json({ 
+  // Placeholder – connect to your IONOS VPS database here
+
+  return c.json({
     message: 'External database integration endpoint',
     note: 'Configure your IONOS VPS API endpoint here'
   })
 })
 
-// ============================================
-// Frontend Routes
-// ============================================
+// ==================================================
+// Frontend Routes – serve the SPA shell
+// ==================================================
 app.get('/', (c) => {
   return c.html(`
     <!DOCTYPE html>
@@ -734,7 +735,7 @@ app.get('/', (c) => {
     </head>
     <body class="bg-gray-50">
         <div id="app"></div>
-        
+
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
         <script src="/static/app.js"></script>
     </body>
