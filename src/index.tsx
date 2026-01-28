@@ -165,9 +165,10 @@ app.post('/api/auth/login', async (c) => {
   const { email, password } = await c.req.json()
   
   const passwordHash = await hashPassword(password)
+  // Search by EITHER email OR name to allow flexible login
   const user = await c.env.DB.prepare(
-    'SELECT id, email, name, role FROM users WHERE email = ? AND password_hash = ?'
-  ).bind(email, passwordHash).first()
+    'SELECT id, email, name, role FROM users WHERE (email = ? OR name = ?) AND password_hash = ?'
+  ).bind(email, email, passwordHash).first()
 
   if (!user) {
     return c.json({ error: 'Invalid credentials' }, 401)
