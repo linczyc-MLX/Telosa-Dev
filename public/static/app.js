@@ -501,12 +501,60 @@ async function handleDelete(id) {
 }
 
 async function handleShare(documentId) {
-  const userId = prompt('Enter user ID to share with:')
-  if (!userId) return
+  // Show modal for sharing
+  const modal = document.createElement('div')
+  modal.id = 'shareModal'
+  modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50'
+  modal.innerHTML = `
+    <div class="bg-white rounded-lg p-6 w-full max-w-md">
+      <h2 class="text-2xl font-bold mb-4">Share Document</h2>
+      <p class="text-gray-600 mb-4">Enter the email address of the user you want to share this document with:</p>
+      <form onsubmit="submitShare(event, ${documentId})" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">User Email</label>
+          <input 
+            type="email" 
+            id="shareEmail" 
+            required 
+            placeholder="user@telosap4p.com"
+            class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500"
+          >
+        </div>
+        <div class="text-sm text-gray-500">
+          <p>Subject: <span class="font-medium">Forwarded from the Telosa P4P Workgroup</span></p>
+        </div>
+        <div class="flex space-x-3">
+          <button type="submit" class="flex-1 bg-blue-600 text-white py-2 rounded hover:bg-blue-700">
+            <i class="fas fa-share mr-2"></i>Share
+          </button>
+          <button type="button" onclick="closeModal()" class="flex-1 bg-gray-300 text-gray-700 py-2 rounded hover:bg-gray-400">
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  `
+  document.body.appendChild(modal)
+}
+
+async function submitShare(event, documentId) {
+  event.preventDefault()
+  
+  const email = document.getElementById('shareEmail').value
 
   try {
-    await api.shareDocument(documentId, parseInt(userId))
-    alert('Document shared successfully!')
+    // Get user by email first
+    const users = await api.getUsers()
+    const targetUser = users.find(u => u.email === email)
+    
+    if (!targetUser) {
+      alert(`No user found with email: ${email}`)
+      return
+    }
+
+    await api.shareDocument(documentId, targetUser.id)
+    alert('Document shared successfully! User will be notified.')
+    closeModal()
   } catch (error) {
     alert(error.response?.data?.error || 'Share failed')
   }
