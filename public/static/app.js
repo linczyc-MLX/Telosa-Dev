@@ -185,7 +185,7 @@ function renderLogin() {
         
         <form id="loginForm" class="space-y-4">
           <div>
-            <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+            <label class="block text-sm font-medium text-gray-700 mb-1">User</label>
             <input 
               type="email" 
               id="loginEmail" 
