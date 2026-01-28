@@ -450,10 +450,8 @@ app.post('/api/documents/:id/share', authMiddleware, async (c) => {
     return c.json({ error: 'Document not found' }, 404)
   }
 
-  // Only owner or admin can share
-  if (document.uploaded_by !== user.id && user.role !== 'admin') {
-    return c.json({ error: 'Access denied' }, 403)
-  }
+  // Anyone can share documents
+  // No access check needed - sharing is a collaborative feature
 
   // Grant access
   await c.env.DB.prepare(
@@ -464,6 +462,42 @@ app.post('/api/documents/:id/share', authMiddleware, async (c) => {
   await c.env.DB.prepare(
     'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
   ).bind(user.id, 'share', documentId, `Shared with user ${userId}`).run()
+
+  return c.json({ success: true })
+})
+
+// Share document by email (Anyone can use)
+app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
+  const user = getUser(c)
+  const documentId = c.req.param('id')
+  const { email } = await c.req.json()
+
+  const document = await c.env.DB.prepare(
+    'SELECT * FROM documents WHERE id = ?'
+  ).bind(documentId).first()
+
+  if (!document) {
+    return c.json({ error: 'Document not found' }, 404)
+  }
+
+  // Look up user by email
+  const targetUser = await c.env.DB.prepare(
+    'SELECT id, name FROM users WHERE email = ?'
+  ).bind(email).first()
+
+  if (!targetUser) {
+    return c.json({ error: 'User not found' }, 404)
+  }
+
+  // Grant access
+  await c.env.DB.prepare(
+    'INSERT OR REPLACE INTO document_access (document_id, user_id, granted_by) VALUES (?, ?, ?)'
+  ).bind(documentId, targetUser.id, user.id).run()
+
+  // Log activity
+  await c.env.DB.prepare(
+    'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
+  ).bind(user.id, 'share', documentId, `Shared with ${targetUser.name} (${email})`).run()
 
   return c.json({ success: true })
 })

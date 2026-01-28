@@ -543,20 +543,23 @@ async function submitShare(event, documentId) {
   const email = document.getElementById('shareEmail').value
 
   try {
-    // Get user by email first
-    const users = await api.getUsers()
-    const targetUser = users.find(u => u.email === email)
+    // Look up user by email via share endpoint
+    // The backend will handle finding the user
+    const response = await axios.post(`${API_BASE}/documents/${documentId}/share-by-email`, { 
+      email: email 
+    })
     
-    if (!targetUser) {
-      alert(`No user found with email: ${email}`)
-      return
+    if (response.data.success) {
+      alert('Document shared successfully! User will be notified.')
+      closeModal()
+      await loadDocuments() // Refresh the list
     }
-
-    await api.shareDocument(documentId, targetUser.id)
-    alert('Document shared successfully! User will be notified.')
-    closeModal()
   } catch (error) {
-    alert(error.response?.data?.error || 'Share failed')
+    if (error.response?.status === 404) {
+      alert(`No user found with email: ${email}`)
+    } else {
+      alert(error.response?.data?.error || 'Share failed')
+    }
   }
 }
 
@@ -702,10 +705,11 @@ async function handleDeleteUser(userId, userEmail) {
 }
 
 function closeModal() {
-  const modal = document.getElementById('userModal')
-  if (modal) {
-    modal.remove()
-  }
+  // Remove any modal (userModal or shareModal)
+  const userModal = document.getElementById('userModal')
+  const shareModal = document.getElementById('shareModal')
+  if (userModal) userModal.remove()
+  if (shareModal) shareModal.remove()
 }
 
 // ============================================
