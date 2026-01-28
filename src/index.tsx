@@ -7,18 +7,6 @@ type Bindings = {
   FILES: R2Bucket
 }
 
-import nodemailer from 'nodemailer';
-
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT || '587', 10),
-  secure: process.env.SMTP_PORT === '465', // true for 465, false for 587
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
-
 const app = new Hono<{ Bindings: Bindings }>()
 
 // JWT Secret (In production, use environment variable)
@@ -33,9 +21,6 @@ app.use('/api/*', cors({
   maxAge: 600,
   credentials: true
 }))
-
-// Static assets are served automatically by Cloudflare Pages from dist/
-// No need for serveStatic middleware
 
 // Serve app.js and style.css with redirects (for Vite build)
 app.get('/static/app.js', async (c) => {
@@ -476,7 +461,7 @@ app.post('/api/documents/:id/share', authMiddleware, async (c) => {
   return c.json({ success: true })
 })
 
-// Share document by email (create user if necessary)
+// Share document by email (create user if necessary and send Postmark notification)
 app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
   const user = getUser(c)
   const documentId = c.req.param('id')
@@ -522,8 +507,41 @@ app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
     'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
   ).bind(user.id, 'share', documentId, `Shared with ${email}`).run()
 
-  // NOTE: This implementation does not actually send an email. To notify the recipient,
-  // integrate with an SMTP or email service here (e.g. MailChannels or SendGrid).
+  // Send Postmark notification
+  try {
+    const postmarkToken = c.env.POSTMARK_SERVER_TOKEN || process.env.POSTMARK_SERVER_TOKEN
+    const fromEmail = c.env.POSTMARK_FROM_EMAIL || process.env.POSTMARK_FROM_EMAIL
+
+    if (!postmarkToken || !fromEmail) {
+      throw new Error('Postmark credentials not configured')
+    }
+
+    const response = await fetch('https://api.postmarkapp.com/email', {
+      method: 'POST',
+      headers: {
+        'X-Postmark-Server-Token': postmarkToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        From: fromEmail,
+        To: email,
+        Subject: `You’ve been granted access to "${document.title}"`,
+        TextBody:
+          `Hello,\n\n${user.email} has shared a document with you in the Telosa P4P repository.\n\n` +
+          `Document Title: ${document.title}\n\n` +
+          `You can log in at https://archive.telosa.dev/ to view the file. If this is your first time, use the 'Forgot password' option with this email address to set a password.\n\n` +
+          `– Telosa P4P Document Repository`
+      })
+    })
+
+    if (!response.ok) {
+      const errText = await response.text()
+      console.error('Postmark error:', errText)
+    }
+  } catch (err) {
+    console.error('Failed to send email via Postmark:', err)
+    // We still return success so sharing isn't blocked
+  }
 
   return c.json({ success: true, message: `Access granted to ${email}` })
 })
