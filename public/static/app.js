@@ -215,9 +215,11 @@ function renderLogin() {
         </form>
 
         <div class="mt-6 p-4 bg-blue-50 rounded-lg text-sm">
-          <p class="font-semibold text-blue-800 mb-2">Demo Credentials:</p>
-          <p class="text-gray-700">Admin: admin@telosap4p.com / admin123</p>
-          <p class="text-gray-700">Member: member@telosap4p.com / admin123</p>
+          <p class="font-semibold text-blue-800 mb-2">Confidentiality Notice</p>
+          <p class="text-gray-700">
+            This system contains confidential and proprietary information. Access is restricted to authorized users only.
+            By logging in, you acknowledge that any unauthorized access, use, disclosure, or distribution of information contained herein is strictly prohibited.
+          </p>
         </div>
       </div>
     </div>
@@ -470,18 +472,14 @@ async function handleDownload(id, filename) {
 
 async function handleView(id) {
   try {
-    // Create a temporary link that opens in a new window
-    // The axios interceptor will automatically add the Authorization header
     const response = await axios.get(`${API_BASE}/documents/${id}/view`, {
       responseType: 'blob'
     })
     
-    // Create a blob URL and open it in a new window
     const blob = new Blob([response.data], { type: response.headers['content-type'] || 'application/pdf' })
     const url = window.URL.createObjectURL(blob)
     window.open(url, '_blank')
     
-    // Clean up the blob URL after a delay
     setTimeout(() => window.URL.revokeObjectURL(url), 100)
   } catch (error) {
     alert(error.response?.data?.error || 'View failed')
@@ -501,7 +499,6 @@ async function handleDelete(id) {
 }
 
 async function handleShare(documentId) {
-  // Show modal for sharing
   const modal = document.createElement('div')
   modal.id = 'shareModal'
   modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50'
@@ -543,8 +540,6 @@ async function submitShare(event, documentId) {
   const email = document.getElementById('shareEmail').value
 
   try {
-    // Look up user by email via share endpoint
-    // The backend will handle finding the user
     const response = await axios.post(`${API_BASE}/documents/${documentId}/share-by-email`, { 
       email: email 
     })
@@ -552,7 +547,7 @@ async function submitShare(event, documentId) {
     if (response.data.success) {
       alert('Document shared successfully! User will be notified.')
       closeModal()
-      await loadDocuments() // Refresh the list
+      await loadDocuments()
     }
   } catch (error) {
     if (error.response?.status === 404) {
@@ -705,7 +700,6 @@ async function handleDeleteUser(userId, userEmail) {
 }
 
 function closeModal() {
-  // Remove any modal (userModal or shareModal)
   const userModal = document.getElementById('userModal')
   const shareModal = document.getElementById('shareModal')
   if (userModal) userModal.remove()
@@ -993,12 +987,10 @@ function render() {
     </div>
   `
 
-  // Attach event listeners
   if (state.view === 'upload') {
     document.getElementById('uploadForm')?.addEventListener('submit', handleUpload)
   }
 
-  // Load data for current view
   if (state.view === 'dashboard' || state.view === 'documents') {
     loadDocuments()
   } else if (state.view === 'users') {
