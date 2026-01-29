@@ -517,6 +517,15 @@ async function handleShare(documentId) {
             class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500"
           >
         </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Comments (optional)</label>
+          <textarea
+            id="shareComment"
+            rows="3"
+            placeholder="Add a note for the recipient (why you’re sharing this, what to look for, etc.)"
+            class="w-full px-3 py-2 border rounded focus:ring-2 focus:ring-blue-500"
+          ></textarea>
+        </div>
         <div class="text-sm text-gray-500">
           <p>Subject: <span class="font-medium">Forwarded from the Telosa P4P Workgroup</span></p>
         </div>
@@ -536,25 +545,23 @@ async function handleShare(documentId) {
 
 async function submitShare(event, documentId) {
   event.preventDefault()
-  
+
   const email = document.getElementById('shareEmail').value
+  const comment = document.getElementById('shareComment')?.value || ''
 
   try {
     const response = await axios.post(`${API_BASE}/documents/${documentId}/share-by-email`, { 
-      email: email 
+      email: email,
+      comment: comment
     })
-    
+
     if (response.data.success) {
-      alert('Document shared successfully! User will be notified.')
+      alert(response.data.message || 'Document shared successfully!')
       closeModal()
-      await loadDocuments()
+      await loadDocuments() // Refresh the list
     }
   } catch (error) {
-    if (error.response?.status === 404) {
-      alert(`No user found with email: ${email}`)
-    } else {
-      alert(error.response?.data?.error || 'Share failed')
-    }
+    alert(error.response?.data?.error || 'Share failed')
   }
 }
 
@@ -696,6 +703,17 @@ async function handleDeleteUser(userId, userEmail) {
     loadUsers()
   } catch (error) {
     alert(error.response?.data?.error || 'Failed to delete user')
+  }
+}
+
+async function toggleUserDocScope(userId, currentValue) {
+  try {
+    const newValue = currentValue ? 0 : 1
+    await api.updateUser(userId, { can_view_all: newValue })
+    alert('User access updated successfully!')
+    loadUsers()
+  } catch (error) {
+    alert(error.response?.data?.error || 'Failed to update user access')
   }
 }
 
@@ -842,6 +860,7 @@ function renderUsersList() {
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Email</th>
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
+          <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Access</th>
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last Login</th>
           <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
         </tr>
@@ -859,10 +878,20 @@ function renderUsersList() {
                 ${user.role}
               </span>
             </td>
+            <td class="px-6 py-4">
+              <span class="px-2 py-1 text-xs rounded ${
+                user.can_view_all ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
+              }">
+                ${user.can_view_all ? 'All Documents' : 'Assigned Only'}
+              </span>
+            </td>
             <td class="px-6 py-4 text-sm text-gray-500">
               ${user.last_login ? new Date(user.last_login).toLocaleString() : 'Never'}
             </td>
             <td class="px-6 py-4 text-sm space-x-2">
+              <button onclick="toggleUserDocScope(${user.id}, ${user.can_view_all ? 1 : 0})" class="text-green-600 hover:text-green-800">
+                <i class="fas fa-user-shield"></i> ${user.can_view_all ? 'Restrict' : 'Grant All'}
+              </button>
               <button onclick="showEditUserModal(${user.id})" class="text-blue-600 hover:text-blue-800">
                 <i class="fas fa-edit"></i> Edit
               </button>
