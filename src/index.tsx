@@ -438,7 +438,8 @@ app.get('/api/documents/:id/download', authMiddleware, async (c) => {
   // Check if user has access
   const canAccess = document.is_public === 1 ||
                     document.uploaded_by === user.id ||
-                    \1                    user.role === 'admin' ||
+                    document.has_access > 0 ||
+                    user.role === 'admin' ||
                     user.can_view_all
 
   if (!canAccess) {
@@ -489,7 +490,8 @@ app.get('/api/documents/:id/view', authMiddleware, async (c) => {
   // Check if user has access
   const canAccess = document.is_public === 1 ||
                     document.uploaded_by === user.id ||
-                    \1                    user.role === 'admin' ||
+                    document.has_access > 0 ||
+                    user.role === 'admin' ||
                     user.can_view_all
 
   if (!canAccess) {
