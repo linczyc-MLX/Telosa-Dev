@@ -2,7 +2,7 @@ name: Deploy to Cloudflare Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -10,37 +10,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout your repository
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # Set up Node (adjust version if needed)
-      - name: Set up Node
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
-      # Install dependencies (uses package-lock.json if present)
-      - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+      - name: Install
+        run: npm ci
 
-      # Build your project (make sure this matches your build script)
-      - name: Build project
+      - name: Build
         run: npm run build
 
-      # Deploy to Cloudflare Pages
+      # Uses wrangler pages deploy (not the deprecated publish)
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/pages-action@1
+        uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: telosa-p4p
-          # This should match the folder produced by your build command.
-          # If your build outputs to another directory, adjust it here.
-          directory: dist
-          wranglerVersion: "3"
+          command: >
+            pages deploy dist
+            --project-name=telosa-p4p
+            --branch=${{ github.ref_name }}
