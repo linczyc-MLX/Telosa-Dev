@@ -1,394 +1,354 @@
-/* Telosa P4P Document Repository Frontend
- * Key fix: PDF viewing uses direct /api/documents/:id/view (cookie-auth), not fetch->blob.
+/* Telosa P4P Document Repository - Frontend App
+ * Served from: GET /static/app.js
+ * API base: /api (Cloudflare Pages Functions / Workers)
+ *
+ * Key reliability fix:
+ * - PDF viewing opens a new tab immediately with a loading UI,
+ * - then fetches the PDF blob with Authorization header,
+ * - then injects into an iframe, and DOES NOT revoke the blob URL early.
  */
-
 (() => {
-  const state = {
-    token: localStorage.getItem('telosa_token') || '',
-    user: null,
-    view: 'documents', // documents | dashboard | upload | activity | users
+  "use strict";
+
+  // -----------------------------
+  // Config + Storage Keys
+  // -----------------------------
+  const API_BASE = "/api";
+
+  // These keys are intentionally simple and stable.
+  // If your prior app used different keys, this file remains self-consistent
+  // and does NOT change any backend authentication logic.
+  const STORAGE = {
+    token: "telosa_token",
+    user: "telosa_user",
+  };
+
+  // -----------------------------
+  // State
+  // -----------------------------
+  let state = {
+    token: loadToken(),
+    user: loadUser(),
+    route: "documents", // dashboard | documents | upload | activity | users
     documents: [],
-    loading: false,
-    error: '',
+    users: [],
+    activity: [],
+    search: "",
   };
 
-  const el = {
-    root: null,
-  };
+  // -----------------------------
+  // Utilities
+  // -----------------------------
+  function $(sel, root = document) {
+    return root.querySelector(sel);
+  }
 
-  function qs(sel) { return document.querySelector(sel); }
+  function escapeHtml(s) {
+    return String(s ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
 
-  async function api(path, opts = {}) {
-    const headers = new Headers(opts.headers || {});
-    headers.set('Content-Type', headers.get('Content-Type') || 'application/json');
+  function formatDate(isoOrEpoch) {
+    try {
+      const d = new Date(isoOrEpoch);
+      if (Number.isNaN(d.getTime())) return "";
+      return d.toLocaleDateString(undefined, { year: "numeric", month: "2-digit", day: "2-digit" });
+    } catch {
+      return "";
+    }
+  }
 
-    // Keep Authorization header for JSON APIs (existing pattern)
-    if (state.token) headers.set('Authorization', `Bearer ${state.token}`);
+  function isPdf(filename, fileType) {
+    const n = String(filename || "").toLowerCase();
+    const t = String(fileType || "").toLowerCase();
+    return n.endsWith(".pdf") || t === "pdf" || t === "report";
+  }
 
-    const res = await fetch(path, { ...opts, headers });
-    const ct = res.headers.get('content-type') || '';
-    const data = ct.includes('application/json') ? await res.json().catch(() => ({})) : await res.text();
+  function toast(msg, kind = "info") {
+    const host = ensureToastHost();
+    const node = document.createElement("div");
+    node.className =
+      "pointer-events-auto mb-2 w-full max-w-sm rounded-lg border bg-white p-3 shadow " +
+      (kind === "error" ? "border-red-200" : kind === "success" ? "border-green-200" : "border-slate-200");
+    node.innerHTML = `
+      <div class="flex items-start gap-3">
+        <div class="mt-0.5 h-2.5 w-2.5 rounded-full ${
+          kind === "error" ? "bg-red-500" : kind === "success" ? "bg-green-500" : "bg-blue-500"
+        }"></div>
+        <div class="text-sm text-slate-800">${escapeHtml(msg)}</div>
+        <button class="ml-auto text-slate-400 hover:text-slate-700" aria-label="Close">✕</button>
+      </div>
+    `;
+    node.querySelector("button").addEventListener("click", () => node.remove());
+    host.appendChild(node);
+    setTimeout(() => node.remove(), 4500);
+  }
+
+  function ensureToastHost() {
+    let host = $("#__toast_host");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "__toast_host";
+      host.className = "fixed right-4 top-4 z-[9999] flex w-[22rem] max-w-[90vw] flex-col";
+      document.body.appendChild(host);
+    }
+    return host;
+  }
+
+  function authHeaders(extra = {}) {
+    if (!state.token) return extra;
+    return { ...extra, Authorization: `Bearer ${state.token}` };
+  }
+
+  async function apiFetch(path, options = {}) {
+    const url = path.startsWith("http") ? path : `${API_BASE}${path}`;
+    const res = await fetch(url, {
+      ...options,
+      headers: authHeaders(options.headers || {}),
+    });
+
+    // Hard auth failure -> force logout to avoid “half logged-in” states
+    if (res.status === 401) {
+      hardLogout();
+      throw new Error("Unauthorized (session expired). Please log in again.");
+    }
+    return res;
+  }
+
+  async function apiJson(path, options = {}) {
+    const res = await apiFetch(path, options);
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
     if (!res.ok) {
-      const msg = (data && data.error) ? data.error : `Request failed (${res.status})`;
+      const msg = data?.error || data?.message || `Request failed (${res.status})`;
       throw new Error(msg);
     }
     return data;
   }
 
-  function setLoading(v) {
-    state.loading = v;
-    render();
+  async function apiBlob(path, options = {}) {
+    const res = await apiFetch(path, options);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || `Request failed (${res.status})`);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("content-disposition") || "";
+    const ct = res.headers.get("content-type") || "";
+    return { blob, contentDisposition: cd, contentType: ct };
   }
 
-  function setError(msg) {
-    state.error = msg || '';
-    render();
-  }
-
-  function setView(v) {
-    state.view = v;
-    render();
-    if (v === 'documents') loadDocuments();
-  }
-
-  function logout() {
-    // Also ask server to clear cookie (best effort)
-    fetch('/api/auth/logout', { method: 'POST', headers: state.token ? { Authorization: `Bearer ${state.token}` } : {} }).catch(() => {});
-    state.token = '';
-    state.user = null;
-    localStorage.removeItem('telosa_token');
-    render();
-  }
-
-  async function login(email, password) {
-    setLoading(true);
-    setError('');
+  function parseFilenameFromContentDisposition(cd) {
+    // Handles: inline; filename="abc.pdf"
+    const m = /filename\*?=(?:UTF-8'')?("?)([^";]+)\1/i.exec(cd || "");
+    if (!m) return "";
     try {
-      const res = await api('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ email, password }),
-      });
-
-      state.token = res.token || '';
-      state.user = res.user || null;
-
-      // Keep token storage as before
-      localStorage.setItem('telosa_token', state.token);
-
-      // IMPORTANT: server now also sets HttpOnly cookie, enabling direct PDF streaming view.
-      setLoading(false);
-      await loadDocuments();
-      render();
-    } catch (e) {
-      setLoading(false);
-      setError(e.message || 'Login failed');
+      return decodeURIComponent(m[2]);
+    } catch {
+      return m[2];
     }
   }
 
-  async function loadDocuments() {
-    if (!state.token) return;
-    setLoading(true);
-    setError('');
+  function saveToken(token) {
+    state.token = token || "";
+    if (token) localStorage.setItem(STORAGE.token, token);
+    else localStorage.removeItem(STORAGE.token);
+  }
+
+  function loadToken() {
+    return localStorage.getItem(STORAGE.token) || "";
+  }
+
+  function saveUser(user) {
+    state.user = user || null;
+    if (user) localStorage.setItem(STORAGE.user, JSON.stringify(user));
+    else localStorage.removeItem(STORAGE.user);
+  }
+
+  function loadUser() {
     try {
-      const res = await api('/api/documents', { method: 'GET' });
-      state.documents = res.documents || [];
-      setLoading(false);
-    } catch (e) {
-      setLoading(false);
-      setError(e.message || 'Failed to load documents');
-      // Token invalid -> force logout
-      if ((e.message || '').toLowerCase().includes('unauthorized')) logout();
+      const raw = localStorage.getItem(STORAGE.user);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
     }
   }
 
-  // === PDF VIEW FIX ===
-  // Use direct open of /api/documents/:id/view so browsers can do streaming + range requests.
-  // Auth is via HttpOnly cookie set by login (server change), with Authorization fallback still supported.
-  function openPdf(docId) {
-    const url = `/api/documents/${encodeURIComponent(docId)}/view`;
-    const w = window.open(url, '_blank', 'noopener');
-    if (!w) {
-      // Popup blocked: degrade gracefully
-      alert('Popup blocked. Please allow popups for this site to view PDFs.');
-    }
+  function hardLogout() {
+    saveToken("");
+    saveUser(null);
+    state.route = "documents";
+    render();
   }
 
-  function downloadDoc(docId) {
-    // Also safe to do direct navigation (cookie-auth)
-    window.location.href = `/api/documents/${encodeURIComponent(docId)}/download`;
+  function setRoute(route) {
+    state.route = route;
+    render();
   }
 
-  function loginView() {
-    return `
-      <div class="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div class="w-full max-w-md bg-white rounded-2xl shadow-lg border border-slate-200">
-          <div class="p-6 border-b border-slate-100">
-            <div class="flex items-center gap-3">
-              <div class="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white font-bold">T</div>
-              <div>
-                <div class="text-lg font-semibold text-slate-900">Telosa P4P Document Repository</div>
-                <div class="text-sm text-slate-500">Secure access required</div>
-              </div>
-            </div>
-          </div>
+  function roleLabel(user) {
+    const r = String(user?.role || user?.userRole || user?.type || "").toLowerCase();
+    if (r.includes("admin")) return "Admin";
+    return "Member";
+  }
 
-          <div class="p-6 space-y-4">
-            ${state.error ? `<div class="rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm p-3">${escapeHtml(state.error)}</div>` : ''}
+  function isAdmin(user) {
+    return roleLabel(user) === "Admin";
+  }
 
-            <div>
-              <label class="block text-sm font-medium text-slate-700 mb-1">Email</label>
-              <input id="login-email" type="email" class="w-full rounded-lg border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="you@example.com" />
-            </div>
-
-            <div>
-              <label class="block text-sm font-medium text-slate-700 mb-1">Password</label>
-              <input id="login-pass" type="password" class="w-full rounded-lg border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="••••••••" />
-            </div>
-
-            <button id="login-btn" class="w-full rounded-lg bg-blue-600 text-white py-2 font-semibold hover:bg-blue-700 disabled:opacity-60" ${state.loading ? 'disabled' : ''}>
-              ${state.loading ? 'Signing in…' : 'Sign In'}
-            </button>
-
-            <!-- CONFIDENTIALITY NOTICE (restored) -->
-            <div class="mt-4 text-xs text-slate-600 border border-slate-200 rounded-lg p-3 bg-slate-50">
-              <div class="font-semibold text-slate-800 mb-1">Confidentiality Notice</div>
-              This system contains confidential Telosa P4P materials. Unauthorized access, use, disclosure, or distribution is prohibited.
-              All activity may be logged and monitored.
-            </div>
-          </div>
-        </div>
+  // -----------------------------
+  // PDF Viewer Reliability Fix
+  // -----------------------------
+  function writePdfShell(win, titleText) {
+    const safeTitle = escapeHtml(titleText || "Document");
+    win.document.open();
+    win.document.write(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${safeTitle}</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    .bar { display:flex; align-items:center; gap:12px; padding:10px 12px; border-bottom: 1px solid #e5e7eb; }
+    .dot { width:10px; height:10px; border-radius:999px; background:#3b82f6; }
+    .muted { color:#64748b; font-size: 13px; }
+    .btn { display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #e5e7eb; border-radius:8px; text-decoration:none; color:#0f172a; }
+    .btn:hover { background:#f8fafc; }
+    .wrap { height: calc(100% - 52px); }
+    #frame { width:100%; height:100%; border:0; display:none; }
+    #loading { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:10px; }
+    .spinner { width:32px; height:32px; border-radius:999px; border: 3px solid #e5e7eb; border-top-color:#3b82f6; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error { display:none; padding: 16px; color:#b91c1c; }
+    code { background:#f1f5f9; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <div class="dot"></div>
+    <div style="font-weight:600;">${safeTitle}</div>
+    <div class="muted" id="status">Loading PDF…</div>
+    <div style="margin-left:auto; display:flex; gap:8px;">
+      <a class="btn" id="openLink" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">Open</a>
+      <a class="btn" id="downloadLink" href="#" download style="display:none;">Download</a>
+    </div>
+  </div>
+  <div class="wrap">
+    <div id="loading">
+      <div class="spinner"></div>
+      <div class="muted">Please wait while the document loads.</div>
+      <div class="muted" style="max-width:720px; text-align:center;">
+        If your browser doesn’t support inline PDF viewing, use <b>Open</b> or <b>Download</b> once they appear.
       </div>
-    `;
+    </div>
+    <div id="error"></div>
+    <iframe id="frame" title="PDF Viewer"></iframe>
+  </div>
+</body>
+</html>`);
+    win.document.close();
   }
 
-  function shellView(contentHtml) {
-    const userName = state.user?.name || 'User';
-    const isAdmin = (state.user?.role || '') === 'admin';
-
-    return `
-      <div class="min-h-screen bg-slate-50">
-        <div class="bg-blue-600 text-white px-6 py-3 flex items-center justify-between shadow">
-          <div class="flex items-center gap-3">
-            <div class="text-white/90">
-              <i class="fa-solid fa-folder-open"></i>
-            </div>
-            <div class="font-semibold">Telosa P4P Document Repository</div>
-          </div>
-          <div class="flex items-center gap-3">
-            <div class="text-sm text-white/90">
-              <i class="fa-solid fa-user"></i> ${escapeHtml(userName)}
-            </div>
-            ${isAdmin ? `<span class="text-xs bg-yellow-400 text-slate-900 font-bold px-2 py-1 rounded">Admin</span>` : ''}
-            <button id="logout-btn" class="text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded">
-              <i class="fa-solid fa-right-from-bracket"></i> Logout
-            </button>
-          </div>
-        </div>
-
-        <div class="flex">
-          <aside class="w-60 bg-white border-r border-slate-200 min-h-[calc(100vh-56px)] p-3">
-            ${navItem('dashboard', 'Dashboard', 'fa-gauge')}
-            ${navItem('documents', 'Documents', 'fa-file-lines')}
-            ${navItem('upload', 'Upload', 'fa-upload')}
-            ${navItem('activity', 'Activity Log', 'fa-list')}
-            ${isAdmin ? navItem('users', 'Users', 'fa-users') : ''}
-          </aside>
-
-          <main class="flex-1 p-6">
-            ${state.error ? `<div class="mb-4 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm p-3">${escapeHtml(state.error)}</div>` : ''}
-            ${contentHtml}
-          </main>
-        </div>
-      </div>
-    `;
-  }
-
-  function navItem(view, label, icon) {
-    const active = state.view === view;
-    return `
-      <button data-nav="${view}" class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm mb-1 ${active ? 'bg-blue-50 text-blue-700 font-semibold' : 'text-slate-700 hover:bg-slate-50'}">
-        <i class="fa-solid ${icon}"></i>
-        <span>${label}</span>
-      </button>
-    `;
-  }
-
-  function documentsView() {
-    return `
-      <div class="flex items-center justify-between mb-4">
-        <div>
-          <div class="text-xl font-semibold text-slate-900">Documents</div>
-          <div class="text-sm text-slate-500">Browse and open PDF reports securely</div>
-        </div>
-        <button data-nav="upload" class="rounded-lg bg-blue-600 text-white px-4 py-2 text-sm font-semibold hover:bg-blue-700">
-          <i class="fa-solid fa-upload"></i> Upload New
-        </button>
-      </div>
-
-      <div class="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div class="p-3 border-b border-slate-100">
-          <input id="doc-search" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Search documents..." />
-        </div>
-
-        <div class="overflow-x-auto">
-          <table class="w-full text-sm">
-            <thead class="bg-slate-50 text-slate-600">
-              <tr>
-                <th class="text-left font-semibold px-4 py-3">Title</th>
-                <th class="text-left font-semibold px-4 py-3">Type</th>
-                <th class="text-left font-semibold px-4 py-3">Date</th>
-                <th class="text-left font-semibold px-4 py-3">Actions</th>
-              </tr>
-            </thead>
-            <tbody id="doc-tbody">
-              ${state.documents.map(docRow).join('') || `<tr><td class="px-4 py-6 text-slate-500" colspan="4">No documents found.</td></tr>`}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
-  }
-
-  function docRow(d) {
-    const id = d.id ?? d.document_id ?? d.documentId;
-    const title = d.title ?? '';
-    const type = d.file_type ?? d.fileType ?? d.type ?? '';
-    const date = d.uploaded_at ?? d.uploadedAt ?? d.created_at ?? d.createdAt ?? '';
-    return `
-      <tr class="border-t border-slate-100">
-        <td class="px-4 py-3">
-          <div class="font-semibold text-slate-900">${escapeHtml(title)}</div>
-          <div class="text-xs text-slate-500">${escapeHtml(d.original_name ?? d.originalName ?? d.filename ?? '')}</div>
-        </td>
-        <td class="px-4 py-3"><span class="text-xs bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-1 rounded">${escapeHtml(type)}</span></td>
-        <td class="px-4 py-3 text-slate-600">${escapeHtml(String(date).slice(0, 10))}</td>
-        <td class="px-4 py-3">
-          <div class="flex items-center gap-3">
-            <button class="text-blue-600 hover:text-blue-800" data-action="view" data-id="${escapeAttr(id)}" title="View">
-              <i class="fa-solid fa-eye"></i>
-            </button>
-            <button class="text-slate-600 hover:text-slate-800" data-action="download" data-id="${escapeAttr(id)}" title="Download">
-              <i class="fa-solid fa-download"></i>
-            </button>
-          </div>
-        </td>
-      </tr>
-    `;
-  }
-
-  function placeholderView(title) {
-    return `
-      <div class="bg-white border border-slate-200 rounded-xl p-6">
-        <div class="text-xl font-semibold text-slate-900 mb-2">${escapeHtml(title)}</div>
-        <div class="text-sm text-slate-500">This section is unchanged; the PDF fix is in the Documents “View” action.</div>
-      </div>
-    `;
-  }
-
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
-  }
-  function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
-
-  function bindEvents() {
-    // Login
-    const loginBtn = qs('#login-btn');
-    if (loginBtn) {
-      loginBtn.onclick = () => {
-        const email = (qs('#login-email') || {}).value || '';
-        const pass = (qs('#login-pass') || {}).value || '';
-        login(email, pass);
-      };
-    }
-
-    // Logout
-    const logoutBtn = qs('#logout-btn');
-    if (logoutBtn) logoutBtn.onclick = logout;
-
-    // Nav
-    document.querySelectorAll('[data-nav]').forEach((b) => {
-      b.addEventListener('click', (e) => {
-        const v = e.currentTarget.getAttribute('data-nav');
-        if (v) setView(v);
-      });
-    });
-
-    // Doc actions
-    document.querySelectorAll('[data-action="view"]').forEach((b) => {
-      b.addEventListener('click', (e) => {
-        const id = e.currentTarget.getAttribute('data-id');
-        if (id) openPdf(id);
-      });
-    });
-    document.querySelectorAll('[data-action="download"]').forEach((b) => {
-      b.addEventListener('click', (e) => {
-        const id = e.currentTarget.getAttribute('data-id');
-        if (id) downloadDoc(id);
-      });
-    });
-
-    // Search
-    const search = qs('#doc-search');
-    if (search) {
-      search.addEventListener('input', () => {
-        const q = String(search.value || '').toLowerCase().trim();
-        const tbody = qs('#doc-tbody');
-        if (!tbody) return;
-
-        const rows = (state.documents || []).filter((d) => {
-          const title = String(d.title || '').toLowerCase();
-          const name = String(d.original_name || d.originalName || d.filename || '').toLowerCase();
-          return !q || title.includes(q) || name.includes(q);
-        });
-
-        tbody.innerHTML = rows.map(docRow).join('') || `<tr><td class="px-4 py-6 text-slate-500" colspan="4">No documents found.</td></tr>`;
-        bindEvents(); // rebind for rebuilt rows
-      });
-    }
-  }
-
-  function render() {
-    if (!el.root) el.root = document.getElementById('app') || document.body;
-
-    if (!state.token || !state.user) {
-      el.root.innerHTML = loginView();
-      bindEvents();
+  async function viewDocumentPdf(doc) {
+    // Open the window FIRST so the user sees a loading UI immediately.
+    const title = doc?.title || doc?.originalName || "Document";
+    const win = window.open("", "_blank", "noopener,noreferrer");
+    if (!win) {
+      toast("Popup blocked. Please allow popups for this site to view PDFs.", "error");
       return;
     }
 
-    let content = '';
-    if (state.view === 'documents') content = documentsView();
-    else if (state.view === 'dashboard') content = placeholderView('Dashboard');
-    else if (state.view === 'upload') content = placeholderView('Upload');
-    else if (state.view === 'activity') content = placeholderView('Activity Log');
-    else if (state.view === 'users') content = placeholderView('Users');
-    else content = documentsView();
+    writePdfShell(win, title);
 
-    el.root.innerHTML = shellView(content);
-    bindEvents();
-  }
+    // Fetch PDF blob using Authorization header (required by your API). :contentReference[oaicite:1]{index=1}
+    try {
+      const { blob, contentDisposition, contentType } = await apiBlob(`/documents/${doc.id}/view`, {
+        method: "GET",
+      });
 
-  async function boot() {
-    render();
+      const filename = parseFilenameFromContentDisposition(contentDisposition) || `${title}.pdf`;
+      const finalBlob = blob.type ? blob : new Blob([blob], { type: contentType || "application/pdf" });
 
-    // If we have a token, try a lightweight call to validate + load user info via login response pattern.
-    // We don’t assume a /me endpoint exists; instead, we load documents and infer auth is valid.
-    if (state.token && !state.user) {
-      try {
-        // Try documents; if it works, we still need a user label, so keep a generic label.
-        await loadDocuments();
-        state.user = state.user || { name: 'User', role: 'member' };
-      } catch (_) {
-        // handled by loadDocuments -> logout
+      const blobUrl = URL.createObjectURL(finalBlob);
+
+      // Populate viewer
+      const statusEl = win.document.getElementById("status");
+      const frame = win.document.getElementById("frame");
+      const loading = win.document.getElementById("loading");
+      const openLink = win.document.getElementById("openLink");
+      const downloadLink = win.document.getElementById("downloadLink");
+
+      if (statusEl) statusEl.textContent = "Loaded";
+      if (openLink) {
+        openLink.href = blobUrl;
+        openLink.style.display = "inline-flex";
+      }
+      if (downloadLink) {
+        downloadLink.href = blobUrl;
+        downloadLink.download = filename;
+        downloadLink.style.display = "inline-flex";
+      }
+
+      if (frame) {
+        frame.src = blobUrl;
+        frame.style.display = "block";
+      }
+      if (loading) loading.style.display = "none";
+
+      // CRITICAL: Do NOT revoke the blob URL immediately.
+      // Revoke only when tab closes (best), plus a long safety timeout.
+      win.addEventListener("beforeunload", () => {
+        try {
+          URL.revokeObjectURL(blobUrl);
+        } catch {}
+      });
+
+      // Safety cleanup after 30 minutes (prevents memory leaks without breaking slow PDF viewers)
+      setTimeout(() => {
+        try {
+          URL.revokeObjectURL(blobUrl);
+        } catch {}
+      }, 30 * 60 * 1000);
+    } catch (err) {
+      const msg = err?.message || String(err);
+      const statusEl = win.document.getElementById("status");
+      const loading = win.document.getElementById("loading");
+      const errorEl = win.document.getElementById("error");
+      if (statusEl) statusEl.textContent = "Failed";
+      if (loading) loading.style.display = "none";
+      if (errorEl) {
+        errorEl.style.display = "block";
+        errorEl.innerHTML =
+          `Failed to load PDF.<br><br><code>${escapeHtml(msg)}</code><br><br>` +
+          `If you keep seeing this, your session may have expired—log out and log back in.`;
       }
     }
-
-    // If already logged in from this session, load docs.
-    if (state.token && state.user) await loadDocuments();
-    render();
   }
 
-  boot();
-})();
+  // -----------------------------
+  // Data loaders
+  // -----------------------------
+  async function loadDocuments() {
+    const data = await apiJson("/documents", { method: "GET" });
+    const docs = data?.documents || data?.data || [];
+    // Normalize a few common shapes
+    state.documents = docs.map((d) => ({
+      id: d.id ?? d.documentId ?? d.docId,
+      title: d.title ?? d.name ?? d.fileName ?? "Untitled",
+      fileType: d.fileType ?? d.type ?? "",
+      uploadedBy: d.uploadedByName ?? d.uploadedBy ?? d.ownerName ?? "",
+      date: d.createdAt ?? d.uploadedAt ?? d.date ?? "",
+      downloads: d.downloads ?? d.downloadCount ?? 0,
+      originalName: d.originalName ?? d.fileName ?? "",
+      isPublic: d.isPublic ?? d.public ?? false,
+    })).filter((d) => d.i
