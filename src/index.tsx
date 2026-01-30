@@ -1,737 +1,538 @@
-import { Hono } from 'hono'
-import { cors } from 'hono/cors'
-import { sign, verify } from 'hono/jwt'
+import { Hono } from 'hono';
 
-type UserRole = 'admin' | 'member' | 'analyst'
+type Env = {
+  DB: D1Database;
+  BUCKET: R2Bucket;
+  JWT_SECRET: string;
+  // Optional external DB proxy (if you use it elsewhere)
+  IONOS_API_URL?: string;
+  IONOS_API_TOKEN?: string;
+};
 
-type Bindings = {
-  DB: D1Database
-  JWT_SECRET: string
-  VIEW_LINK_SECRET?: string
-  // R2 binding name varies in real projects; we support multiple common names.
-  BUCKET?: R2Bucket
-  R2_BUCKET?: R2Bucket
-  R2?: R2Bucket
+type JwtPayload = {
+  sub: string; // user id
+  email: string;
+  name: string;
+  role: 'admin' | 'member';
+  exp: number; // unix seconds
+  iat: number; // unix seconds
+};
 
-  // Optional external integration (per your docs)
-  IONOS_QUERY_URL?: string
-  IONOS_API_KEY?: string
+const app = new Hono<{ Bindings: Env; Variables: { user?: JwtPayload } }>();
 
-  // On Cloudflare Pages, ASSETS is commonly available for static passthrough
-  ASSETS?: { fetch: (req: Request) => Promise<Response> }
+/* ----------------------------- small helpers ----------------------------- */
+
+const te = new TextEncoder();
+
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
 }
 
-type Vars = {
-  user?: {
-    id: number
-    email: string
-    name: string
-    role: UserRole
-  }
+function hexFromBuf(buf: ArrayBuffer) {
+  const bytes = new Uint8Array(buf);
+  let out = '';
+  for (const b of bytes) out += b.toString(16).padStart(2, '0');
+  return out;
 }
 
-const app = new Hono<{ Bindings: Bindings; Variables: Vars }>()
-
-/** ---------- Helpers ---------- **/
-
-const jsonError = (message: string, status = 400) =>
-  new Response(JSON.stringify({ success: false, error: message }), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-
-function getBucket(env: Bindings): R2Bucket {
-  const b = env.BUCKET || env.R2_BUCKET || env.R2
-  if (!b) throw new Error('R2 bucket binding not found (expected BUCKET or R2_BUCKET or R2).')
-  return b
+async function sha256Hex(input: string) {
+  const buf = await crypto.subtle.digest('SHA-256', te.encode(input));
+  return hexFromBuf(buf);
 }
 
-function ipFromReq(req: Request): string {
-  return (
-    req.headers.get('CF-Connecting-IP') ||
-    req.headers.get('X-Forwarded-For') ||
-    req.headers.get('X-Real-IP') ||
-    ''
-  )
+function b64urlFromBytes(bytes: Uint8Array) {
+  // btoa expects binary string
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  const b64 = btoa(bin);
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-function nowSec(): number {
-  return Math.floor(Date.now() / 1000)
+function bytesFromB64url(b64url: string) {
+  const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64.length % 4 ? '='.repeat(4 - (b64.length % 4)) : '';
+  const bin = atob(b64 + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
-async function sha256Hex(input: string): Promise<string> {
-  const enc = new TextEncoder()
-  const buf = await crypto.subtle.digest('SHA-256', enc.encode(input))
-  const bytes = new Uint8Array(buf)
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
+async function hmacSha256(secret: string, data: string) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    te.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, te.encode(data));
+  return new Uint8Array(sig);
 }
 
-function sanitizeFilename(name: string): string {
-  // keep it simple + safe for Content-Disposition
-  return name.replace(/[^\w.\- ()[\]]+/g, '_')
+async function signJwt(payload: Omit<JwtPayload, 'iat'>, secret: string) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const iat = nowSec();
+  const full: JwtPayload = { ...payload, iat };
+  const enc = (obj: any) => b64urlFromBytes(te.encode(JSON.stringify(obj)));
+  const h = enc(header);
+  const p = enc(full);
+  const data = `${h}.${p}`;
+  const sig = await hmacSha256(secret, data);
+  return `${data}.${b64urlFromBytes(sig)}`;
 }
 
-function parseIntId(s: string | undefined): number | null {
-  if (!s) return null
-  const n = Number(s)
-  return Number.isInteger(n) && n > 0 ? n : null
-}
+async function verifyJwt(token: string, secret: string): Promise<JwtPayload | null> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
 
-async function logActivity(
-  c: any,
-  userId: number,
-  action: string,
-  documentId?: number,
-  details?: string
-) {
-  const ip = ipFromReq(c.req.raw)
-  await c.env.DB.prepare(
-    `INSERT INTO activity_log (user_id, action, document_id, details, ip_address, created_at)
-     VALUES (?, ?, ?, ?, ?, datetime('now'))`
-  )
-    .bind(userId, action, documentId ?? null, details ?? null, ip)
-    .run()
-}
+  const [h, p, s] = parts;
+  const data = `${h}.${p}`;
+  const expected = await hmacSha256(secret, data);
+  const got = bytesFromB64url(s);
 
-async function getUserFromBearer(c: any) {
-  const auth = c.req.header('Authorization') || ''
-  const m = auth.match(/^Bearer\s+(.+)$/i)
-  if (!m) return null
+  // constant-time compare
+  if (got.length !== expected.length) return null;
+  let diff = 0;
+  for (let i = 0; i < got.length; i++) diff |= got[i] ^ expected[i];
+  if (diff !== 0) return null;
+
+  const payloadJson = new TextDecoder().decode(bytesFromB64url(p));
+  let payload: JwtPayload;
   try {
-    const payload: any = await verify(m[1], c.env.JWT_SECRET)
-    const id = Number(payload?.id)
-    if (!id) return null
-    return {
-      id,
-      email: String(payload.email || ''),
-      name: String(payload.name || ''),
-      role: String(payload.role || 'member') as UserRole,
-    }
+    payload = JSON.parse(payloadJson);
   } catch {
-    return null
+    return null;
   }
+  if (!payload?.exp || nowSec() > payload.exp) return null;
+  return payload;
 }
 
-function requireAuth() {
-  return async (c: any, next: any) => {
-    const u = await getUserFromBearer(c)
-    if (!u) return jsonError('Unauthorized', 401)
-    c.set('user', u)
-    await next()
+function parseCookies(cookieHeader: string | null) {
+  const out: Record<string, string> = {};
+  if (!cookieHeader) return out;
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const i = part.indexOf('=');
+    if (i === -1) continue;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    out[k] = v;
   }
+  return out;
 }
 
-function requireAdmin() {
-  return async (c: any, next: any) => {
-    const u = c.get('user') as Vars['user']
-    if (!u) return jsonError('Unauthorized', 401)
-    if (u.role !== 'admin') return jsonError('Forbidden', 403)
-    await next()
-  }
+function setCookie(name: string, value: string, opts: { maxAge?: number; httpOnly?: boolean; secure?: boolean; sameSite?: 'Lax' | 'Strict' | 'None'; path?: string } = {}) {
+  const segs = [`${name}=${value}`];
+  segs.push(`Path=${opts.path ?? '/'}`);
+  if (opts.maxAge !== undefined) segs.push(`Max-Age=${opts.maxAge}`);
+  if (opts.httpOnly) segs.push('HttpOnly');
+  if (opts.secure) segs.push('Secure');
+  if (opts.sameSite) segs.push(`SameSite=${opts.sameSite}`);
+  return segs.join('; ');
 }
 
-async function canAccessDocument(c: any, userId: number, role: UserRole, docId: number): Promise<boolean> {
-  if (role === 'admin') return true
-
-  const doc = await c.env.DB.prepare(
-    `SELECT id, uploaded_by, is_public FROM documents WHERE id = ?`
-  )
-    .bind(docId)
-    .first<any>()
-
-  if (!doc) return false
-  if (Number(doc.is_public) === 1) return true
-  if (Number(doc.uploaded_by) === userId) return true
-
-  const access = await c.env.DB.prepare(
-    `SELECT 1 FROM document_access WHERE document_id = ? AND user_id = ? LIMIT 1`
-  )
-    .bind(docId, userId)
-    .first<any>()
-
-  return !!access
+function json(c: any, status: number, body: any, extraHeaders?: Record<string, string>) {
+  const h = new Headers(extraHeaders);
+  h.set('Content-Type', 'application/json; charset=utf-8');
+  return c.newResponse(JSON.stringify(body), status, h);
 }
 
-async function getDocumentRow(c: any, docId: number) {
-  return c.env.DB.prepare(
-    `SELECT d.*, u.name as uploaded_by_name
-     FROM documents d
-     LEFT JOIN users u ON u.id = d.uploaded_by
-     WHERE d.id = ?`
-  )
-    .bind(docId)
-    .first<any>()
-}
+/* ----------------------------- CORS (minimal) ---------------------------- */
 
-/** ---------- Signed link (view/download) ---------- **/
+app.use('/api/*', async (c, next) => {
+  // Same-origin is typical for Pages; this is permissive but safe for credentials.
+  const origin = c.req.header('Origin');
+  const allowed = origin && (
+    origin.startsWith('https://archive.telosa.dev') ||
+    origin.startsWith('http://localhost') ||
+    origin.startsWith('https://localhost')
+  );
 
-type SignedDocToken = {
-  typ: 'doc'
-  mode: 'view' | 'download'
-  docId: number
-  uid: number
-  role: UserRole
-  exp: number
-}
-
-function tokenSecret(env: Bindings): string {
-  // Separate secret is best; fallback keeps deploy simpler if you forget to set it.
-  return env.VIEW_LINK_SECRET || env.JWT_SECRET
-}
-
-async function makeDocLinkToken(env: Bindings, payload: Omit<SignedDocToken, 'typ'>) {
-  return sign({ typ: 'doc', ...payload }, tokenSecret(env))
-}
-
-async function verifyDocLinkToken(env: Bindings, token: string): Promise<SignedDocToken | null> {
-  try {
-    const p: any = await verify(token, tokenSecret(env))
-    if (p?.typ !== 'doc') return null
-    const exp = Number(p.exp)
-    if (!exp || exp < nowSec()) return null
-    return {
-      typ: 'doc',
-      mode: p.mode,
-      docId: Number(p.docId),
-      uid: Number(p.uid),
-      role: p.role as UserRole,
-      exp,
-    }
-  } catch {
-    return null
-  }
-}
-
-function originFromReq(req: Request): string {
-  return new URL(req.url).origin
-}
-
-/** ---------- Middleware ---------- **/
-
-app.use(
-  '/api/*',
-  cors({
-    origin: '*',
-    allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'Range'],
-    exposeHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Disposition'],
-    maxAge: 86400,
-  })
-)
-
-/** ---------- Public: health + UI passthrough ---------- **/
-
-app.get('/api/health', (c) => c.json({ ok: true }))
-
-/**
- * If running on Pages, let ASSETS serve static files.
- * If not, at least return a minimal HTML shell for `/`.
- */
-const INDEX_HTML = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Telosa P4P Document Repository</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
-</head>
-<body class="bg-slate-50">
-  <div id="app"></div>
-  <script src="/static/app.js"></script>
-</body>
-</html>`
-
-app.get('*', async (c) => {
-  const path = new URL(c.req.url).pathname
-
-  // Let API routes be handled by the defined handlers.
-  if (path.startsWith('/api/')) return c.notFound()
-
-  // Prefer static assets if available (Cloudflare Pages)
-  const assets = (c.env as any).ASSETS
-  if (assets?.fetch) {
-    const res = await assets.fetch(c.req.raw)
-    if (res && res.status !== 404) return res
+  if (allowed) {
+    c.header('Access-Control-Allow-Origin', origin);
+    c.header('Vary', 'Origin');
+    c.header('Access-Control-Allow-Credentials', 'true');
+    c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range');
+    c.header('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Disposition, Content-Length');
+    c.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   }
 
-  if (path === '/' || path === '/index.html') return c.html(INDEX_HTML)
-  return c.notFound()
-})
+  if (c.req.method === 'OPTIONS') return c.body(null, 204);
+  await next();
+});
 
-/** ---------- DB init (first-time setup) ---------- **/
+/* --------------------------- auth middleware ----------------------------- */
 
-app.get('/api/init-db', async (c) => {
-  // Tables per your repo documentation :contentReference[oaicite:2]{index=2}
-  const stmts = [
-    `CREATE TABLE IF NOT EXISTS users (
+app.use('/api/*', async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+
+  // Public endpoints
+  if (
+    path === '/api/init-db' ||
+    path === '/api/auth/login' ||
+    path === '/api/auth/register'
+  ) {
+    await next();
+    return;
+  }
+
+  const auth = c.req.header('Authorization');
+  const cookies = parseCookies(c.req.header('Cookie') ?? null);
+  const cookieToken = cookies['telosa_token'];
+
+  let token: string | null = null;
+  if (auth?.toLowerCase().startsWith('bearer ')) token = auth.slice(7).trim();
+  else if (cookieToken) token = cookieToken;
+
+  if (!token) return json(c, 401, { success: false, error: 'Unauthorized' });
+
+  const payload = await verifyJwt(token, c.env.JWT_SECRET);
+  if (!payload) return json(c, 401, { success: false, error: 'Unauthorized' });
+
+  c.set('user', payload);
+  await next();
+});
+
+/* ------------------------------ db helpers ------------------------------- */
+
+let tablesCache: string[] | null = null;
+
+async function listTables(db: D1Database) {
+  if (tablesCache) return tablesCache;
+  const r = await db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all();
+  tablesCache = (r.results as any[]).map(x => String(x.name));
+  return tablesCache;
+}
+
+async function pickTable(db: D1Database, candidates: string[]) {
+  const tables = await listTables(db);
+  for (const c of candidates) if (tables.includes(c)) return c;
+  return null;
+}
+
+type ColMap = Record<string, string>;
+const colCache = new Map<string, ColMap>();
+
+async function tableCols(db: D1Database, table: string) {
+  const key = `cols:${table}`;
+  const cached = colCache.get(key);
+  if (cached) return cached;
+
+  const r = await db.prepare(`PRAGMA table_info(${table})`).all();
+  const names = new Set((r.results as any[]).map(x => String(x.name)));
+
+  const has = (...cands: string[]) => cands.find(n => names.has(n)) ?? null;
+
+  // Provide flexible mapping for likely variants
+  const map: ColMap = {
+    // users
+    user_id: has('id', 'user_id', 'userId') ?? 'id',
+    user_email: has('email', 'user_email', 'userEmail') ?? 'email',
+    user_name: has('name', 'full_name', 'fullName') ?? 'name',
+    user_role: has('role', 'user_role', 'userRole') ?? 'role',
+    user_pass: has('password_hash', 'passwordHash', 'password') ?? 'password_hash',
+    user_active: has('is_active', 'isActive', 'active') ?? 'is_active',
+    // documents
+    doc_id: has('id', 'doc_id', 'document_id', 'documentId') ?? 'id',
+    doc_title: has('title', 'doc_title', 'document_title', 'documentTitle') ?? 'title',
+    doc_desc: has('description', 'doc_description', 'document_description', 'documentDescription') ?? 'description',
+    doc_type: has('file_type', 'fileType', 'type') ?? 'file_type',
+    doc_key: has('file_key', 'fileKey', 'key') ?? 'file_key',
+    doc_orig: has('original_name', 'originalName', 'filename', 'file_name') ?? 'original_name',
+    doc_mime: has('mime_type', 'mimeType', 'content_type') ?? 'mime_type',
+    doc_size: has('file_size', 'fileSize', 'size_bytes', 'size') ?? 'file_size',
+    doc_uploaded_by: has('uploaded_by', 'uploadedBy', 'owner_id', 'ownerId', 'user_id', 'userId') ?? 'uploaded_by',
+    doc_uploaded_at: has('uploaded_at', 'uploadedAt', 'created_at', 'createdAt') ?? 'uploaded_at',
+    doc_downloads: has('downloads', 'download_count', 'downloadCount') ?? 'downloads',
+    doc_public: has('is_public', 'isPublic', 'public') ?? 'is_public',
+  };
+
+  colCache.set(key, map);
+  return map;
+}
+
+async function ensureInit(db: D1Database) {
+  // Safe: creates tables if missing; does not overwrite existing.
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
       name TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'member',
-      created_at DATETIME DEFAULT (datetime('now')),
-      last_login DATETIME
-    );`,
-    `CREATE TABLE IF NOT EXISTS documents (
+      password_hash TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT NOT NULL,
       description TEXT,
-      filename TEXT NOT NULL,
+      file_type TEXT NOT NULL,
       file_key TEXT NOT NULL,
-      file_type TEXT NOT NULL DEFAULT 'other',
-      mime_type TEXT,
-      file_size INTEGER,
-      uploaded_by INTEGER,
-      uploaded_at DATETIME DEFAULT (datetime('now')),
-      updated_at DATETIME,
-      is_public INTEGER NOT NULL DEFAULT 0,
-      download_count INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY(uploaded_by) REFERENCES users(id)
-    );`,
-    `CREATE TABLE IF NOT EXISTS document_access (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      file_size INTEGER NOT NULL,
+      uploaded_by INTEGER NOT NULL,
+      uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+      downloads INTEGER NOT NULL DEFAULT 0,
+      is_public INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS document_shares (
       document_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      granted_by INTEGER NOT NULL,
-      granted_at DATETIME DEFAULT (datetime('now')),
-      FOREIGN KEY(document_id) REFERENCES documents(id),
-      FOREIGN KEY(user_id) REFERENCES users(id),
-      FOREIGN KEY(granted_by) REFERENCES users(id)
-    );`,
-    `CREATE TABLE IF NOT EXISTS activity_log (
+      UNIQUE(document_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS activity (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
+      user_id INTEGER,
       action TEXT NOT NULL,
-      document_id INTEGER,
       details TEXT,
-      ip_address TEXT,
-      created_at DATETIME DEFAULT (datetime('now')),
-      FOREIGN KEY(user_id) REFERENCES users(id),
-      FOREIGN KEY(document_id) REFERENCES documents(id)
-    );`,
-  ]
+      ip TEXT,
+      user_agent TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+}
 
-  for (const sql of stmts) {
-    await c.env.DB.exec(sql)
-  }
+async function logActivity(c: any, action: string, details?: string) {
+  const user = c.get('user') as JwtPayload | undefined;
+  const ip = c.req.header('CF-Connecting-IP') ?? c.req.header('X-Forwarded-For') ?? '';
+  const ua = c.req.header('User-Agent') ?? '';
+  const uid = user?.sub ? Number(user.sub) : null;
 
-  // Seed demo accounts (only if not exists)
-  const demos = [
-    { email: 'admin@telosap4p.com', name: 'Admin User', role: 'admin' as UserRole },
-    { email: 'member@telosap4p.com', name: 'Member User', role: 'member' as UserRole },
-    { email: 'analyst@telosap4p.com', name: 'Analyst User', role: 'analyst' as UserRole },
-  ]
+  // Use whichever activity table exists (or created via init-db)
+  const activityTable = (await pickTable(c.env.DB, ['activity', 'activities'])) ?? 'activity';
+  await c.env.DB.prepare(
+    `INSERT INTO ${activityTable} (user_id, action, details, ip, user_agent) VALUES (?, ?, ?, ?, ?)`
+  ).bind(uid, action, details ?? null, ip, ua).run();
+}
 
-  const pwHash = await sha256Hex('admin123')
-  for (const u of demos) {
+/* ------------------------------- endpoints ------------------------------- */
+
+app.get('/api/init-db', async (c) => {
+  await ensureInit(c.env.DB);
+
+  // Optional: seed an admin if none exists (non-destructive)
+  const usersTable = (await pickTable(c.env.DB, ['users'])) ?? 'users';
+  const cols = await tableCols(c.env.DB, usersTable);
+
+  const count = await c.env.DB.prepare(`SELECT COUNT(1) as n FROM ${usersTable}`).all();
+  const n = Number((count.results as any[])[0]?.n ?? 0);
+
+  if (n === 0) {
+    const adminEmail = 'admin@telosa.dev';
+    const adminPass = 'admin123';
+    const passHash = await sha256Hex(adminPass);
     await c.env.DB.prepare(
-      `INSERT OR IGNORE INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)`
-    )
-      .bind(u.email, pwHash, u.name, u.role)
-      .run()
+      `INSERT INTO ${usersTable} (${cols.user_email}, ${cols.user_name}, ${cols.user_role}, ${cols.user_pass}, ${cols.user_active})
+       VALUES (?, ?, ?, ?, 1)`
+    ).bind(adminEmail, 'Admin User', 'admin', passHash).run();
   }
 
-  return c.json({ success: true })
-})
-
-/** ---------- Auth ---------- **/
+  return json(c, 200, { success: true });
+});
 
 app.post('/api/auth/login', async (c) => {
-  const body = await c.req.json().catch(() => null)
-  if (!body?.email || !body?.password) return jsonError('Missing email/password', 400)
+  const body = await c.req.json().catch(() => null);
+  const email = String(body?.email ?? '').trim();
+  const password = String(body?.password ?? '');
 
-  const email = String(body.email).toLowerCase().trim()
-  const password = String(body.password)
+  if (!email || !password) return json(c, 400, { success: false, error: 'Missing email/password' });
 
-  const user = await c.env.DB.prepare(
-    `SELECT id, email, password_hash, name, role FROM users WHERE email = ?`
-  )
-    .bind(email)
-    .first<any>()
+  const usersTable = (await pickTable(c.env.DB, ['users'])) ?? 'users';
+  const cols = await tableCols(c.env.DB, usersTable);
 
-  if (!user) return jsonError('Invalid credentials', 401)
+  const row = await c.env.DB.prepare(
+    `SELECT * FROM ${usersTable} WHERE lower(${cols.user_email}) = lower(?) LIMIT 1`
+  ).bind(email).first();
 
-  const hash = await sha256Hex(password)
-  if (hash !== String(user.password_hash)) return jsonError('Invalid credentials', 401)
+  if (!row) return json(c, 401, { success: false, error: 'Invalid credentials' });
 
-  const payload = {
-    id: Number(user.id),
-    email: String(user.email),
-    name: String(user.name),
-    role: String(user.role) as UserRole,
-    exp: nowSec() + 60 * 60 * 24, // 24h
-  }
+  const storedHash = String((row as any)[cols.user_pass] ?? '');
+  const activeVal = (row as any)[cols.user_active];
+  const isActive = activeVal === undefined ? 1 : Number(activeVal);
 
-  const token = await sign(payload, c.env.JWT_SECRET)
+  if (!isActive) return json(c, 403, { success: false, error: 'Account disabled' });
 
-  await c.env.DB.prepare(`UPDATE users SET last_login = datetime('now') WHERE id = ?`)
-    .bind(payload.id)
-    .run()
-  await logActivity(c, payload.id, 'login')
+  const passHash = await sha256Hex(password);
+  if (!storedHash || storedHash !== passHash) return json(c, 401, { success: false, error: 'Invalid credentials' });
 
-  return c.json({ success: true, token, user: { id: payload.id, email: payload.email, name: payload.name, role: payload.role } })
-})
+  const roleRaw = String((row as any)[cols.user_role] ?? 'member').toLowerCase();
+  const role = (roleRaw === 'admin') ? 'admin' : 'member';
 
-app.post('/api/auth/register', async (c) => {
-  const body = await c.req.json().catch(() => null)
-  if (!body?.email || !body?.password || !body?.name) return jsonError('Missing fields', 400)
+  const payload: Omit<JwtPayload, 'iat'> = {
+    sub: String((row as any)[cols.user_id]),
+    email: String((row as any)[cols.user_email]),
+    name: String((row as any)[cols.user_name]),
+    role,
+    exp: nowSec() + 60 * 60 * 24 * 7, // 7 days
+  };
 
-  const email = String(body.email).toLowerCase().trim()
-  const password = String(body.password)
-  const name = String(body.name).trim()
+  const token = await signJwt(payload, c.env.JWT_SECRET);
 
-  const hash = await sha256Hex(password)
+  // Critical fix: set HttpOnly cookie so PDFs can be opened directly (no blob auth fetch)
+  c.header('Set-Cookie', setCookie('telosa_token', token, { maxAge: 60 * 60 * 24 * 7, httpOnly: true, secure: true, sameSite: 'Lax', path: '/' }));
 
-  try {
-    const res = await c.env.DB.prepare(
-      `INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, 'member')`
-    )
-      .bind(email, hash, name)
-      .run()
+  await logActivity(c, 'login', `email=${email}`);
 
-    const userId = Number(res.meta.last_row_id)
-    await logActivity(c, userId, 'register')
+  return json(c, 200, {
+    success: true,
+    token,
+    user: { id: payload.sub, email: payload.email, name: payload.name, role: payload.role },
+  });
+});
 
-    return c.json({ success: true, userId })
-  } catch {
-    return jsonError('User already exists', 409)
-  }
-})
+app.post('/api/auth/logout', async (c) => {
+  c.header('Set-Cookie', setCookie('telosa_token', '', { maxAge: 0, httpOnly: true, secure: true, sameSite: 'Lax', path: '/' }));
+  await logActivity(c, 'logout');
+  return json(c, 200, { success: true });
+});
 
-/** ---------- Documents ---------- **/
-
-app.get('/api/documents', requireAuth(), async (c) => {
-  const u = c.get('user')!
-  const rows = await c.env.DB.prepare(
-    `SELECT d.id, d.title, d.description, d.filename, d.file_type, d.mime_type, d.file_size,
-            d.uploaded_by, u2.name as uploaded_by_name, d.uploaded_at, d.is_public, d.download_count
-     FROM documents d
-     LEFT JOIN users u2 ON u2.id = d.uploaded_by
-     WHERE d.is_public = 1
-        OR d.uploaded_by = ?
-        OR ? = 'admin'
-        OR EXISTS (SELECT 1 FROM document_access a WHERE a.document_id = d.id AND a.user_id = ?)
-     ORDER BY d.uploaded_at DESC`
-  )
-    .bind(u.id, u.role, u.id)
-    .all<any>()
-
-  return c.json({ documents: rows.results || [] })
-})
-
-app.post('/api/documents/upload', requireAuth(), async (c) => {
-  const u = c.get('user')!
-
-  const body = await c.req.parseBody()
-  const file = body['file'] as File | undefined
-  if (!file) return jsonError('Missing file', 400)
-
-  const title = String(body['title'] || file.name).trim()
-  const description = String(body['description'] || '').trim()
-  const fileType = String(body['fileType'] || 'other').trim() // 'report' | 'spreadsheet' | 'other'
-  const isPublic = String(body['isPublic'] || '0') === '1' || String(body['isPublic'] || '').toLowerCase() === 'true'
-
-  const bucket = getBucket(c.env)
-  const safeName = sanitizeFilename(file.name)
-  const key = `${Date.now()}-${crypto.randomUUID()}-${safeName}`
-
-  const buf = await file.arrayBuffer()
-  await bucket.put(key, buf, {
-    httpMetadata: { contentType: file.type || 'application/octet-stream' },
-  })
-
-  const res = await c.env.DB.prepare(
-    `INSERT INTO documents
-      (title, description, filename, file_key, file_type, mime_type, file_size, uploaded_by, is_public, uploaded_at, download_count)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)`
-  )
-    .bind(
-      title,
-      description || null,
-      safeName,
-      key,
-      fileType || 'other',
-      file.type || null,
-      buf.byteLength,
-      u.id,
-      isPublic ? 1 : 0
-    )
-    .run()
-
-  const documentId = Number(res.meta.last_row_id)
-  await logActivity(c, u.id, 'upload', documentId, `Uploaded ${safeName}`)
-
-  return c.json({ success: true, documentId, fileKey: key })
-})
-
-app.post('/api/documents/:id/share', requireAuth(), async (c) => {
-  const u = c.get('user')!
-  const docId = parseIntId(c.req.param('id'))
-  if (!docId) return jsonError('Invalid document id', 400)
-
-  // owner or admin
-  const doc = await c.env.DB.prepare(`SELECT uploaded_by FROM documents WHERE id = ?`)
-    .bind(docId)
-    .first<any>()
-  if (!doc) return jsonError('Not found', 404)
-
-  if (u.role !== 'admin' && Number(doc.uploaded_by) !== u.id) return jsonError('Forbidden', 403)
-
-  const body = await c.req.json().catch(() => null)
-  const targetUserId = Number(body?.userId)
-  if (!targetUserId) return jsonError('Missing userId', 400)
-
-  await c.env.DB.prepare(
-    `INSERT OR IGNORE INTO document_access (document_id, user_id, granted_by) VALUES (?, ?, ?)`
-  )
-    .bind(docId, targetUserId, u.id)
-    .run()
-
-  await logActivity(c, u.id, 'share', docId, `Shared with user ${targetUserId}`)
-  return c.json({ success: true })
-})
-
-app.delete('/api/documents/:id', requireAuth(), async (c) => {
-  const u = c.get('user')!
-  const docId = parseIntId(c.req.param('id'))
-  if (!docId) return jsonError('Invalid document id', 400)
-
-  const doc = await c.env.DB.prepare(`SELECT uploaded_by, file_key, filename FROM documents WHERE id = ?`)
-    .bind(docId)
-    .first<any>()
-  if (!doc) return jsonError('Not found', 404)
-
-  if (u.role !== 'admin' && Number(doc.uploaded_by) !== u.id) return jsonError('Forbidden', 403)
-
-  const bucket = getBucket(c.env)
-  await bucket.delete(String(doc.file_key))
-
-  await c.env.DB.prepare(`DELETE FROM document_access WHERE document_id = ?`).bind(docId).run()
-  await c.env.DB.prepare(`DELETE FROM documents WHERE id = ?`).bind(docId).run()
-
-  await logActivity(c, u.id, 'delete', docId, `Deleted ${doc.filename}`)
-  return c.json({ success: true })
-})
-
-/** ---------- Signed link endpoints (NEW) ---------- **/
-
-app.get('/api/documents/:id/view-link', requireAuth(), async (c) => {
-  const u = c.get('user')!
-  const docId = parseIntId(c.req.param('id'))
-  if (!docId) return jsonError('Invalid document id', 400)
-
-  const ok = await canAccessDocument(c, u.id, u.role, docId)
-  if (!ok) return jsonError('Forbidden', 403)
-
-  // 5 minutes is long enough for slow mobile opens, short enough for safety.
-  const token = await makeDocLinkToken(c.env, {
-    mode: 'view',
-    docId,
-    uid: u.id,
-    role: u.role,
-    exp: nowSec() + 60 * 5,
-  })
-
-  const url = `${originFromReq(c.req.raw)}/api/documents/${docId}/view?t=${encodeURIComponent(token)}`
-  return c.json({ url })
-})
-
-app.get('/api/documents/:id/download-link', requireAuth(), async (c) => {
-  const u = c.get('user')!
-  const docId = parseIntId(c.req.param('id'))
-  if (!docId) return jsonError('Invalid document id', 400)
-
-  const ok = await canAccessDocument(c, u.id, u.role, docId)
-  if (!ok) return jsonError('Forbidden', 403)
-
-  const token = await makeDocLinkToken(c.env, {
-    mode: 'download',
-    docId,
-    uid: u.id,
-    role: u.role,
-    exp: nowSec() + 60 * 5,
-  })
-
-  const url = `${originFromReq(c.req.raw)}/api/documents/${docId}/download?t=${encodeURIComponent(token)}`
-  return c.json({ url })
-})
-
-/** ---------- View / Download (UPDATED: supports ?t= signed token) ---------- **/
-
-async function resolveAuthForDoc(c: any, docId: number, mode: 'view' | 'download') {
-  const token = c.req.query('t')
-  if (token) {
-    const p = await verifyDocLinkToken(c.env, token)
-    if (!p || p.docId !== docId || p.mode !== mode) return null
-    return { id: p.uid, role: p.role as UserRole, via: 'signed' as const }
-  }
-
-  const u = await getUserFromBearer(c)
-  if (!u) return null
-  return { id: u.id, role: u.role, via: 'bearer' as const }
+function parseRange(rangeHeader: string | null, totalSize: number) {
+  if (!rangeHeader) return null;
+  const m = /^bytes=(\d+)-(\d+)?$/i.exec(rangeHeader.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = m[2] ? Number(m[2]) : (totalSize - 1);
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  if (start < 0 || end < start || start >= totalSize) return null;
+  return { start, end };
 }
 
-function parseRangeHeader(rangeHeader: string | null, size: number): { start: number; end: number } | null {
-  if (!rangeHeader) return null
-  const m = rangeHeader.match(/bytes=(\d*)-(\d*)/i)
-  if (!m) return null
-  let start = m[1] ? Number(m[1]) : NaN
-  let end = m[2] ? Number(m[2]) : NaN
+async function canAccessDocument(c: any, docId: number) {
+  const user = c.get('user') as JwtPayload;
+  const isAdmin = user.role === 'admin';
 
-  if (Number.isNaN(start) && !Number.isNaN(end)) {
-    // suffix bytes: "-500" means last 500 bytes
-    const suffix = end
-    if (!Number.isFinite(suffix) || suffix <= 0) return null
-    start = Math.max(0, size - suffix)
-    end = size - 1
-  } else if (!Number.isNaN(start) && Number.isNaN(end)) {
-    // "500-" means from 500 to end
-    end = size - 1
-  }
+  const docsTable = (await pickTable(c.env.DB, ['documents'])) ?? 'documents';
+  const sharesTable = await pickTable(c.env.DB, ['document_shares', 'documentShares', 'shares']) ?? 'document_shares';
+  const cols = await tableCols(c.env.DB, docsTable);
 
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
-  if (start < 0 || end < start || start >= size) return null
-  end = Math.min(end, size - 1)
-  return { start, end }
+  const doc = await c.env.DB.prepare(
+    `SELECT * FROM ${docsTable} WHERE ${cols.doc_id} = ? LIMIT 1`
+  ).bind(docId).first();
+
+  if (!doc) return { ok: false as const, doc: null };
+
+  if (isAdmin) return { ok: true as const, doc };
+
+  const isPublic = Number((doc as any)[cols.doc_public] ?? 0) === 1;
+  const ownerId = Number((doc as any)[cols.doc_uploaded_by] ?? -1);
+  if (isPublic || ownerId === Number(user.sub)) return { ok: true as const, doc };
+
+  // Shared?
+  const shared = await c.env.DB.prepare(
+    `SELECT 1 FROM ${sharesTable} WHERE document_id = ? AND user_id = ? LIMIT 1`
+  ).bind(docId, Number(user.sub)).first();
+
+  if (shared) return { ok: true as const, doc };
+  return { ok: false as const, doc };
 }
 
-async function serveDocBinary(
-  c: any,
-  docId: number,
-  disposition: 'inline' | 'attachment',
-  authUserId: number,
-  authRole: UserRole,
-  logAction: 'view' | 'download'
-) {
-  const ok = await canAccessDocument(c, authUserId, authRole, docId)
-  if (!ok) return jsonError('Forbidden', 403)
+app.get('/api/documents', async (c) => {
+  const user = c.get('user') as JwtPayload;
+  const isAdmin = user.role === 'admin';
 
-  const doc = await getDocumentRow(c, docId)
-  if (!doc) return jsonError('Not found', 404)
+  const docsTable = (await pickTable(c.env.DB, ['documents'])) ?? 'documents';
+  const sharesTable = await pickTable(c.env.DB, ['document_shares', 'documentShares', 'shares']) ?? 'document_shares';
+  const cols = await tableCols(c.env.DB, docsTable);
 
-  const bucket = getBucket(c.env)
-  const key = String(doc.file_key)
-  const head = await bucket.head(key)
-  if (!head) return jsonError('File missing in storage', 500)
+  let sql = `SELECT * FROM ${docsTable}`;
+  const binds: any[] = [];
 
-  const size = Number(head.size)
-  const range = parseRangeHeader(c.req.header('Range') || c.req.header('range') || null, size)
-
-  // R2 range fetch (if requested)
-  let obj: R2ObjectBody | null = null
-  let status = 200
-  const headers = new Headers()
-
-  headers.set('Content-Type', String(doc.mime_type || head.httpMetadata?.contentType || 'application/octet-stream'))
-  headers.set('Content-Disposition', `${disposition}; filename="${sanitizeFilename(String(doc.filename || 'document'))}"`)
-  headers.set('Accept-Ranges', 'bytes')
-  headers.set('Cache-Control', 'private, no-store, max-age=0')
-
-  if (range) {
-    const length = range.end - range.start + 1
-    obj = await bucket.get(key, { range: { offset: range.start, length } })
-    if (!obj) return jsonError('File missing in storage', 500)
-    status = 206
-    headers.set('Content-Range', `bytes ${range.start}-${range.end}/${size}`)
-    headers.set('Content-Length', String(length))
-  } else {
-    obj = await bucket.get(key)
-    if (!obj) return jsonError('File missing in storage', 500)
-    headers.set('Content-Length', String(size))
+  if (!isAdmin) {
+    sql += ` WHERE (${cols.doc_public} = 1) OR (${cols.doc_uploaded_by} = ?) OR (${cols.doc_id} IN (SELECT document_id FROM ${sharesTable} WHERE user_id = ?))`;
+    binds.push(Number(user.sub), Number(user.sub));
   }
 
-  // Update stats/logs
-  if (logAction === 'download') {
-    await c.env.DB.prepare(`UPDATE documents SET download_count = download_count + 1 WHERE id = ?`)
-      .bind(docId)
-      .run()
-  }
-  await logActivity(c, authUserId, logAction, docId)
+  sql += ` ORDER BY ${cols.doc_uploaded_at} DESC`;
 
-  return new Response(obj.body, { status, headers })
-}
+  const r = await c.env.DB.prepare(sql).bind(...binds).all();
+  return json(c, 200, { documents: r.results ?? [] });
+});
 
 app.get('/api/documents/:id/view', async (c) => {
-  const docId = parseIntId(c.req.param('id'))
-  if (!docId) return jsonError('Invalid document id', 400)
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return json(c, 400, { success: false, error: 'Bad id' });
 
-  const auth = await resolveAuthForDoc(c, docId, 'view')
-  if (!auth) return jsonError('Unauthorized', 401)
+  const access = await canAccessDocument(c, id);
+  if (!access.doc) return json(c, 404, { success: false, error: 'Not found' });
+  if (!access.ok) return json(c, 403, { success: false, error: 'Forbidden' });
 
-  return serveDocBinary(c, docId, 'inline', auth.id, auth.role, 'view')
-})
+  const docsTable = (await pickTable(c.env.DB, ['documents'])) ?? 'documents';
+  const cols = await tableCols(c.env.DB, docsTable);
+
+  const key = String((access.doc as any)[cols.doc_key]);
+  const filename = String((access.doc as any)[cols.doc_orig] ?? `document-${id}.pdf`);
+  const mime = String((access.doc as any)[cols.doc_mime] ?? 'application/pdf');
+
+  const obj = await c.env.BUCKET.get(key);
+  if (!obj) return json(c, 404, { success: false, error: 'File missing' });
+
+  const totalSize = obj.size;
+  const range = parseRange(c.req.header('Range') ?? null, totalSize);
+
+  const headers = new Headers();
+  headers.set('Content-Type', mime);
+  headers.set('Content-Disposition', `inline; filename="${filename.replace(/"/g, '')}"`);
+  headers.set('Accept-Ranges', 'bytes');
+  headers.set('Cache-Control', 'private, max-age=0, must-revalidate');
+
+  // IMPORTANT: Range support => fast render + reliable seek on Chrome/Safari/Firefox/iPad
+  if (range) {
+    const len = range.end - range.start + 1;
+    const partial = await c.env.BUCKET.get(key, { range: { offset: range.start, length: len } });
+    if (!partial?.body) return json(c, 500, { success: false, error: 'Range read failed' });
+
+    headers.set('Content-Range', `bytes ${range.start}-${range.end}/${totalSize}`);
+    headers.set('Content-Length', String(len));
+
+    return new Response(partial.body, { status: 206, headers });
+  }
+
+  headers.set('Content-Length', String(totalSize));
+  await logActivity(c, 'view_document', `document_id=${id}`);
+  return new Response(obj.body, { status: 200, headers });
+});
 
 app.get('/api/documents/:id/download', async (c) => {
-  const docId = parseIntId(c.req.param('id'))
-  if (!docId) return jsonError('Invalid document id', 400)
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return json(c, 400, { success: false, error: 'Bad id' });
 
-  const auth = await resolveAuthForDoc(c, docId, 'download')
-  if (!auth) return jsonError('Unauthorized', 401)
+  const access = await canAccessDocument(c, id);
+  if (!access.doc) return json(c, 404, { success: false, error: 'Not found' });
+  if (!access.ok) return json(c, 403, { success: false, error: 'Forbidden' });
 
-  return serveDocBinary(c, docId, 'attachment', auth.id, auth.role, 'download')
-})
+  const docsTable = (await pickTable(c.env.DB, ['documents'])) ?? 'documents';
+  const cols = await tableCols(c.env.DB, docsTable);
 
-/** ---------- Users (admin) ---------- **/
+  const key = String((access.doc as any)[cols.doc_key]);
+  const filename = String((access.doc as any)[cols.doc_orig] ?? `document-${id}`);
+  const mime = String((access.doc as any)[cols.doc_mime] ?? 'application/octet-stream');
 
-app.get('/api/users', requireAuth(), requireAdmin(), async (c) => {
-  const rows = await c.env.DB.prepare(
-    `SELECT id, email, name, role, created_at, last_login FROM users ORDER BY created_at DESC`
-  ).all<any>()
+  const obj = await c.env.BUCKET.get(key);
+  if (!obj) return json(c, 404, { success: false, error: 'File missing' });
 
-  return c.json({ users: rows.results || [] })
-})
+  const headers = new Headers();
+  headers.set('Content-Type', mime);
+  headers.set('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+  headers.set('Accept-Ranges', 'bytes');
+  headers.set('Cache-Control', 'private, max-age=0, must-revalidate');
 
-/** ---------- Activity ---------- **/
+  // Support range on downloads too
+  const totalSize = obj.size;
+  const range = parseRange(c.req.header('Range') ?? null, totalSize);
+  if (range) {
+    const len = range.end - range.start + 1;
+    const partial = await c.env.BUCKET.get(key, { range: { offset: range.start, length: len } });
+    headers.set('Content-Range', `bytes ${range.start}-${range.end}/${totalSize}`);
+    headers.set('Content-Length', String(len));
+    await logActivity(c, 'download_document', `document_id=${id} range=${range.start}-${range.end}`);
+    return new Response(partial?.body ?? null, { status: 206, headers });
+  }
 
-app.get('/api/activity', requireAuth(), async (c) => {
-  const u = c.get('user')!
-  const rows =
-    u.role === 'admin'
-      ? await c.env.DB.prepare(
-          `SELECT a.*, u.name as user_name
-           FROM activity_log a
-           LEFT JOIN users u ON u.id = a.user_id
-           ORDER BY a.created_at DESC
-           LIMIT 500`
-        ).all<any>()
-      : await c.env.DB.prepare(
-          `SELECT a.*
-           FROM activity_log a
-           WHERE a.user_id = ?
-           ORDER BY a.created_at DESC
-           LIMIT 500`
-        )
-          .bind(u.id)
-          .all<any>()
+  headers.set('Content-Length', String(totalSize));
+  await logActivity(c, 'download_document', `document_id=${id}`);
+  return new Response(obj.body, { status: 200, headers });
+});
 
-  return c.json({ activities: rows.results || [] })
-})
-
-/** ---------- External DB Integration (admin) ---------- **/
-
-app.post('/api/external/query', requireAuth(), requireAdmin(), async (c) => {
-  const url = c.env.IONOS_QUERY_URL
-  const apiKey = c.env.IONOS_API_KEY
-  if (!url || !apiKey) return jsonError('IONOS integration not configured', 501)
-
-  const body = await c.req.json().catch(() => null)
-  if (!body?.query) return jsonError('Missing query', 400)
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ query: body.query, params: body.params || [] }),
-  })
-
-  const data = await res.json().catch(() => ({}))
-  return c.json(data, res.status)
-})
-
-export default app
+export default app;
