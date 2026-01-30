@@ -1,1089 +1,737 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { jwt, sign } from 'hono/jwt'
+import { sign, verify } from 'hono/jwt'
+
+type UserRole = 'admin' | 'member' | 'analyst'
 
 type Bindings = {
   DB: D1Database
-  FILES: R2Bucket
-  POSTMARK_SERVER_TOKEN?: string
-  POSTMARK_FROM_EMAIL?: string
+  JWT_SECRET: string
+  VIEW_LINK_SECRET?: string
+  // R2 binding name varies in real projects; we support multiple common names.
+  BUCKET?: R2Bucket
+  R2_BUCKET?: R2Bucket
+  R2?: R2Bucket
+
+  // Optional external integration (per your docs)
+  IONOS_QUERY_URL?: string
+  IONOS_API_KEY?: string
+
+  // On Cloudflare Pages, ASSETS is commonly available for static passthrough
+  ASSETS?: { fetch: (req: Request) => Promise<Response> }
 }
 
-const app = new Hono<{ Bindings: Bindings }>()
-
-// JWT Secret (In production, use environment variable)
-const JWT_SECRET = 'telosa-p4p-secret-key-change-in-production'
-
-// Enable CORS with proper configuration
-app.use('/api/*', cors({
-  origin: '*',
-  allowHeaders: ['Content-Type', 'Authorization'],
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  exposeHeaders: ['Content-Length'],
-  maxAge: 600,
-  credentials: true
-}))
-
-// Serve app.js and style.css with redirects (for Vite build)
-app.get('/static/app.js', async (c) => {
-  return c.redirect('/app.js', 301)
-})
-app.get('/static/style.css', async (c) => {
-  return c.redirect('/style.css', 301)
-})
-
-// JWT middleware for protected routes
-const authMiddleware = jwt({
-  secret: JWT_SECRET,
-  alg: 'HS256',
-})
-
-// Helper to get user from JWT payload (then refresh from DB so role/flags changes apply immediately)
-async function getUser(c: any) {
-  const payload = c.get('jwtPayload')
-  if (!payload?.id) return null
-
-  try {
-    const dbUser: any = await c.env.DB.prepare(
-      'SELECT id, email, name, role, can_view_all, force_password_reset FROM users WHERE id = ?'
-    ).bind(payload.id).first()
-
-    if (!dbUser) {
-      // Fallback to token payload if DB lookup fails (should be rare)
-      return {
-        id: payload.id,
-        email: payload.email,
-        name: payload.email,
-        role: payload.role,
-        can_view_all: 0,
-        force_password_reset: 0
-      }
-    }
-
-    return {
-      id: dbUser.id,
-      email: dbUser.email,
-      name: dbUser.name,
-      role: dbUser.role,
-      can_view_all: dbUser.can_view_all === 1,
-      force_password_reset: dbUser.force_password_reset === 1
-    }
-  } catch (err) {
-    console.error('Failed to refresh user from DB:', err)
-    return {
-      id: payload.id,
-      email: payload.email,
-      name: payload.email,
-      role: payload.role,
-      can_view_all: 0,
-      force_password_reset: 0
-    }
+type Vars = {
+  user?: {
+    id: number
+    email: string
+    name: string
+    role: UserRole
   }
 }
 
-// Simple password hashing (In production, use bcrypt)
-async function hashPassword(password: string): Promise<string> {
-  const encoder = new TextEncoder()
-  const data = encoder.encode(password)
-  const hash = await crypto.subtle.digest('SHA-256', data)
-  return Array.from(new Uint8Array(hash))
-    .map(b => b.toString(16).padStart(2, '0'))
+const app = new Hono<{ Bindings: Bindings; Variables: Vars }>()
+
+/** ---------- Helpers ---------- **/
+
+const jsonError = (message: string, status = 400) =>
+  new Response(JSON.stringify({ success: false, error: message }), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+
+function getBucket(env: Bindings): R2Bucket {
+  const b = env.BUCKET || env.R2_BUCKET || env.R2
+  if (!b) throw new Error('R2 bucket binding not found (expected BUCKET or R2_BUCKET or R2).')
+  return b
+}
+
+function ipFromReq(req: Request): string {
+  return (
+    req.headers.get('CF-Connecting-IP') ||
+    req.headers.get('X-Forwarded-For') ||
+    req.headers.get('X-Real-IP') ||
+    ''
+  )
+}
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000)
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const enc = new TextEncoder()
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(input))
+  const bytes = new Uint8Array(buf)
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
 }
 
-// ==================================================
-// Database Initialization
-// ==================================================
-app.get('/api/init-db', async (c) => {
+function sanitizeFilename(name: string): string {
+  // keep it simple + safe for Content-Disposition
+  return name.replace(/[^\w.\- ()[\]]+/g, '_')
+}
+
+function parseIntId(s: string | undefined): number | null {
+  if (!s) return null
+  const n = Number(s)
+  return Number.isInteger(n) && n > 0 ? n : null
+}
+
+async function logActivity(
+  c: any,
+  userId: number,
+  action: string,
+  documentId?: number,
+  details?: string
+) {
+  const ip = ipFromReq(c.req.raw)
+  await c.env.DB.prepare(
+    `INSERT INTO activity_log (user_id, action, document_id, details, ip_address, created_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))`
+  )
+    .bind(userId, action, documentId ?? null, details ?? null, ip)
+    .run()
+}
+
+async function getUserFromBearer(c: any) {
+  const auth = c.req.header('Authorization') || ''
+  const m = auth.match(/^Bearer\s+(.+)$/i)
+  if (!m) return null
   try {
-    // Determine whether this is a brand-new DB
-    const usersTable: any = await c.env.DB.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
-    ).first()
-    const isFreshDb = !usersTable
-
-    // Helper: add columns safely (SQLite has no IF NOT EXISTS for columns)
-    const ensureColumn = async (table: string, column: string, definition: string) => {
-      try {
-        await c.env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run()
-      } catch (_) {
-        // Ignore "duplicate column name" errors
-      }
+    const payload: any = await verify(m[1], c.env.JWT_SECRET)
+    const id = Number(payload?.id)
+    if (!id) return null
+    return {
+      id,
+      email: String(payload.email || ''),
+      name: String(payload.name || ''),
+      role: String(payload.role || 'member') as UserRole,
     }
-
-    // Core tables (idempotent)
-    await c.env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        name TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'member',
-        can_view_all INTEGER NOT NULL DEFAULT 0,
-        force_password_reset INTEGER NOT NULL DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_login DATETIME
-      )
-    `).run()
-
-    await c.env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        description TEXT,
-        filename TEXT NOT NULL,
-        file_type TEXT NOT NULL,
-        is_public INTEGER DEFAULT 0,
-        uploaded_by INTEGER,
-        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        download_count INTEGER DEFAULT 0,
-        r2_key TEXT NOT NULL,
-        FOREIGN KEY (uploaded_by) REFERENCES users(id)
-      )
-    `).run()
-
-    await c.env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS document_access (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        document_id INTEGER,
-        user_id INTEGER,
-        granted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        granted_by INTEGER,
-        FOREIGN KEY (document_id) REFERENCES documents(id),
-        FOREIGN KEY (user_id) REFERENCES users(id),
-        FOREIGN KEY (granted_by) REFERENCES users(id),
-        UNIQUE(document_id, user_id)
-      )
-    `).run()
-
-    await c.env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        action TEXT NOT NULL,
-        document_id INTEGER,
-        details TEXT,
-        ip_address TEXT,
-        user_agent TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id),
-        FOREIGN KEY (document_id) REFERENCES documents(id)
-      )
-    `).run()
-
-    // Invite / password-set tokens (used for first-time access + password reset)
-    await c.env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS user_invites (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        token TEXT UNIQUE NOT NULL,
-        type TEXT NOT NULL DEFAULT 'invite', -- 'invite' | 'reset'
-        expires_at DATETIME NOT NULL,
-        created_by INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        used_at DATETIME,
-        FOREIGN KEY (user_id) REFERENCES users(id),
-        FOREIGN KEY (created_by) REFERENCES users(id)
-      )
-    `).run()
-
-    // If this DB existed before these features, add missing columns safely
-    await ensureColumn('users', 'can_view_all', 'INTEGER NOT NULL DEFAULT 0')
-    await ensureColumn('users', 'force_password_reset', 'INTEGER NOT NULL DEFAULT 0')
-
-    // Seed demo users only on a brand-new DB (or if empty)
-    const userCountRow: any = await c.env.DB.prepare('SELECT COUNT(*) as count FROM users').first()
-    const userCount = Number(userCountRow?.count || 0)
-
-    if (isFreshDb || userCount === 0) {
-      const adminPasswordHash = await hashPassword('admin123')
-      const memberPasswordHash = await hashPassword('admin123')
-
-      await c.env.DB.prepare(`
-        INSERT OR IGNORE INTO users (email, password_hash, name, role)
-        VALUES (?, ?, ?, ?)
-      `).bind('admin@telosap4p.com', adminPasswordHash, 'Admin User', 'admin').run()
-
-      await c.env.DB.prepare(`
-        INSERT OR IGNORE INTO users (email, password_hash, name, role)
-        VALUES (?, ?, ?, ?)
-      `).bind('member@telosap4p.com', memberPasswordHash, 'Member User', 'member').run()
-    }
-
-    return c.json({
-      success: true,
-      message: isFreshDb ? 'Database initialized successfully' : 'Database verified/updated successfully'
-    })
-  } catch (error) {
-    console.error('Database init error:', error)
-    return c.json({ error: 'Database initialization failed' }, 500)
+  } catch {
+    return null
   }
+}
+
+function requireAuth() {
+  return async (c: any, next: any) => {
+    const u = await getUserFromBearer(c)
+    if (!u) return jsonError('Unauthorized', 401)
+    c.set('user', u)
+    await next()
+  }
+}
+
+function requireAdmin() {
+  return async (c: any, next: any) => {
+    const u = c.get('user') as Vars['user']
+    if (!u) return jsonError('Unauthorized', 401)
+    if (u.role !== 'admin') return jsonError('Forbidden', 403)
+    await next()
+  }
+}
+
+async function canAccessDocument(c: any, userId: number, role: UserRole, docId: number): Promise<boolean> {
+  if (role === 'admin') return true
+
+  const doc = await c.env.DB.prepare(
+    `SELECT id, uploaded_by, is_public FROM documents WHERE id = ?`
+  )
+    .bind(docId)
+    .first<any>()
+
+  if (!doc) return false
+  if (Number(doc.is_public) === 1) return true
+  if (Number(doc.uploaded_by) === userId) return true
+
+  const access = await c.env.DB.prepare(
+    `SELECT 1 FROM document_access WHERE document_id = ? AND user_id = ? LIMIT 1`
+  )
+    .bind(docId, userId)
+    .first<any>()
+
+  return !!access
+}
+
+async function getDocumentRow(c: any, docId: number) {
+  return c.env.DB.prepare(
+    `SELECT d.*, u.name as uploaded_by_name
+     FROM documents d
+     LEFT JOIN users u ON u.id = d.uploaded_by
+     WHERE d.id = ?`
+  )
+    .bind(docId)
+    .first<any>()
+}
+
+/** ---------- Signed link (view/download) ---------- **/
+
+type SignedDocToken = {
+  typ: 'doc'
+  mode: 'view' | 'download'
+  docId: number
+  uid: number
+  role: UserRole
+  exp: number
+}
+
+function tokenSecret(env: Bindings): string {
+  // Separate secret is best; fallback keeps deploy simpler if you forget to set it.
+  return env.VIEW_LINK_SECRET || env.JWT_SECRET
+}
+
+async function makeDocLinkToken(env: Bindings, payload: Omit<SignedDocToken, 'typ'>) {
+  return sign({ typ: 'doc', ...payload }, tokenSecret(env))
+}
+
+async function verifyDocLinkToken(env: Bindings, token: string): Promise<SignedDocToken | null> {
+  try {
+    const p: any = await verify(token, tokenSecret(env))
+    if (p?.typ !== 'doc') return null
+    const exp = Number(p.exp)
+    if (!exp || exp < nowSec()) return null
+    return {
+      typ: 'doc',
+      mode: p.mode,
+      docId: Number(p.docId),
+      uid: Number(p.uid),
+      role: p.role as UserRole,
+      exp,
+    }
+  } catch {
+    return null
+  }
+}
+
+function originFromReq(req: Request): string {
+  return new URL(req.url).origin
+}
+
+/** ---------- Middleware ---------- **/
+
+app.use(
+  '/api/*',
+  cors({
+    origin: '*',
+    allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization', 'Range'],
+    exposeHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Disposition'],
+    maxAge: 86400,
+  })
+)
+
+/** ---------- Public: health + UI passthrough ---------- **/
+
+app.get('/api/health', (c) => c.json({ ok: true }))
+
+/**
+ * If running on Pages, let ASSETS serve static files.
+ * If not, at least return a minimal HTML shell for `/`.
+ */
+const INDEX_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Telosa P4P Document Repository</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+</head>
+<body class="bg-slate-50">
+  <div id="app"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>`
+
+app.get('*', async (c) => {
+  const path = new URL(c.req.url).pathname
+
+  // Let API routes be handled by the defined handlers.
+  if (path.startsWith('/api/')) return c.notFound()
+
+  // Prefer static assets if available (Cloudflare Pages)
+  const assets = (c.env as any).ASSETS
+  if (assets?.fetch) {
+    const res = await assets.fetch(c.req.raw)
+    if (res && res.status !== 404) return res
+  }
+
+  if (path === '/' || path === '/index.html') return c.html(INDEX_HTML)
+  return c.notFound()
 })
 
+/** ---------- DB init (first-time setup) ---------- **/
 
-// ==================================================
-// API Routes – Authentication
-// ==================================================
-app.post('/api/auth/login', async (c) => {
-  const { email, password } = await c.req.json()
+app.get('/api/init-db', async (c) => {
+  // Tables per your repo documentation :contentReference[oaicite:2]{index=2}
+  const stmts = [
+    `CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member',
+      created_at DATETIME DEFAULT (datetime('now')),
+      last_login DATETIME
+    );`,
+    `CREATE TABLE IF NOT EXISTS documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      description TEXT,
+      filename TEXT NOT NULL,
+      file_key TEXT NOT NULL,
+      file_type TEXT NOT NULL DEFAULT 'other',
+      mime_type TEXT,
+      file_size INTEGER,
+      uploaded_by INTEGER,
+      uploaded_at DATETIME DEFAULT (datetime('now')),
+      updated_at DATETIME,
+      is_public INTEGER NOT NULL DEFAULT 0,
+      download_count INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY(uploaded_by) REFERENCES users(id)
+    );`,
+    `CREATE TABLE IF NOT EXISTS document_access (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      document_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      granted_by INTEGER NOT NULL,
+      granted_at DATETIME DEFAULT (datetime('now')),
+      FOREIGN KEY(document_id) REFERENCES documents(id),
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(granted_by) REFERENCES users(id)
+    );`,
+    `CREATE TABLE IF NOT EXISTS activity_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      document_id INTEGER,
+      details TEXT,
+      ip_address TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(document_id) REFERENCES documents(id)
+    );`,
+  ]
 
-  const passwordHash = await hashPassword(password)
-  // Search by email OR name to allow flexible login
-  const user = await c.env.DB.prepare(
-    'SELECT id, email, name, role FROM users WHERE (email = ? OR name = ?) AND password_hash = ?'
-  ).bind(email, email, passwordHash).first()
-
-  if (!user) {
-    return c.json({ error: 'Invalid credentials' }, 401)
+  for (const sql of stmts) {
+    await c.env.DB.exec(sql)
   }
 
-  // Update last login
-  await c.env.DB.prepare(
-    'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?'
-  ).bind(user.id).run()
+  // Seed demo accounts (only if not exists)
+  const demos = [
+    { email: 'admin@telosap4p.com', name: 'Admin User', role: 'admin' as UserRole },
+    { email: 'member@telosap4p.com', name: 'Member User', role: 'member' as UserRole },
+    { email: 'analyst@telosap4p.com', name: 'Analyst User', role: 'analyst' as UserRole },
+  ]
 
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
-  ).bind(user.id, 'login', `User logged in from ${c.req.header('cf-connecting-ip') || 'unknown'}`).run()
+  const pwHash = await sha256Hex('admin123')
+  for (const u of demos) {
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)`
+    )
+      .bind(u.email, pwHash, u.name, u.role)
+      .run()
+  }
 
-  // Create JWT token
-  const token = await sign({
-    id: user.id,
-    email: user.email,
-    role: user.role
-  }, JWT_SECRET, 'HS256')
+  return c.json({ success: true })
+})
 
-  return c.json({
-    success: true,
-    token,
-    user: { id: user.id, email: user.email, name: user.name, role: user.role }
-  })
+/** ---------- Auth ---------- **/
+
+app.post('/api/auth/login', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  if (!body?.email || !body?.password) return jsonError('Missing email/password', 400)
+
+  const email = String(body.email).toLowerCase().trim()
+  const password = String(body.password)
+
+  const user = await c.env.DB.prepare(
+    `SELECT id, email, password_hash, name, role FROM users WHERE email = ?`
+  )
+    .bind(email)
+    .first<any>()
+
+  if (!user) return jsonError('Invalid credentials', 401)
+
+  const hash = await sha256Hex(password)
+  if (hash !== String(user.password_hash)) return jsonError('Invalid credentials', 401)
+
+  const payload = {
+    id: Number(user.id),
+    email: String(user.email),
+    name: String(user.name),
+    role: String(user.role) as UserRole,
+    exp: nowSec() + 60 * 60 * 24, // 24h
+  }
+
+  const token = await sign(payload, c.env.JWT_SECRET)
+
+  await c.env.DB.prepare(`UPDATE users SET last_login = datetime('now') WHERE id = ?`)
+    .bind(payload.id)
+    .run()
+  await logActivity(c, payload.id, 'login')
+
+  return c.json({ success: true, token, user: { id: payload.id, email: payload.email, name: payload.name, role: payload.role } })
 })
 
 app.post('/api/auth/register', async (c) => {
-  const { email, password, name } = await c.req.json()
+  const body = await c.req.json().catch(() => null)
+  if (!body?.email || !body?.password || !body?.name) return jsonError('Missing fields', 400)
 
-  // Check if user already exists
-  const existing = await c.env.DB.prepare(
-    'SELECT id FROM users WHERE email = ?'
-  ).bind(email).first()
+  const email = String(body.email).toLowerCase().trim()
+  const password = String(body.password)
+  const name = String(body.name).trim()
 
-  if (existing) {
-    return c.json({ error: 'Email already registered' }, 400)
-  }
+  const hash = await sha256Hex(password)
 
-  const passwordHash = await hashPassword(password)
-
-  const result = await c.env.DB.prepare(
-    'INSERT INTO users (email, password_hash, name, role, can_view_all) VALUES (?, ?, ?, ?, ?)'
-  ).bind(email, passwordHash, name, 'member').run()
-
-  return c.json({ success: true, userId: result.meta.last_row_id })
-})
-
-
-// Set password via invite/reset token
-app.post('/api/auth/set-password', async (c) => {
   try {
-    const { token, password } = await c.req.json()
+    const res = await c.env.DB.prepare(
+      `INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, 'member')`
+    )
+      .bind(email, hash, name)
+      .run()
 
-    const cleanToken = (token || '').toString().trim()
-    const newPassword = (password || '').toString()
+    const userId = Number(res.meta.last_row_id)
+    await logActivity(c, userId, 'register')
 
-    if (!cleanToken) return c.json({ error: 'Token is required' }, 400)
-    if (newPassword.length < 8) return c.json({ error: 'Password must be at least 8 characters' }, 400)
-
-    const row: any = await c.env.DB.prepare(`
-      SELECT ui.id as invite_id, ui.user_id, ui.expires_at, ui.used_at, u.email
-      FROM user_invites ui
-      JOIN users u ON u.id = ui.user_id
-      WHERE ui.token = ?
-    `).bind(cleanToken).first()
-
-    if (!row) return c.json({ error: 'Invalid or expired link' }, 400)
-    if (row.used_at) return c.json({ error: 'This link has already been used' }, 400)
-
-    const expiresAt = new Date(row.expires_at)
-    if (isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-      return c.json({ error: 'This link has expired' }, 400)
-    }
-
-    const passwordHash = await hashPassword(newPassword)
-
-    await c.env.DB.prepare(
-      'UPDATE users SET password_hash = ?, force_password_reset = 0 WHERE id = ?'
-    ).bind(passwordHash, row.user_id).run()
-
-    await c.env.DB.prepare(
-      "UPDATE user_invites SET used_at = CURRENT_TIMESTAMP WHERE id = ?"
-    ).bind(row.invite_id).run()
-
-    // Log activity
-    await c.env.DB.prepare(`
-      INSERT INTO activity_log (user_id, action, document_id, details, ip_address, user_agent)
-      VALUES (?, ?, NULL, ?, ?, ?)
-    `).bind(
-      row.user_id,
-      'set_password',
-      JSON.stringify({ via: 'invite_token' }),
-      c.req.header('CF-Connecting-IP') || '',
-      c.req.header('User-Agent') || ''
-    ).run()
-
-    return c.json({ success: true })
-  } catch (error) {
-    console.error('Set password error:', error)
-    return c.json({ error: 'Failed to set password' }, 500)
+    return c.json({ success: true, userId })
+  } catch {
+    return jsonError('User already exists', 409)
   }
 })
 
+/** ---------- Documents ---------- **/
 
-// ==================================================
-// API Routes – Documents
-// ==================================================
-app.get('/api/documents', authMiddleware, async (c) => {
-  const user = await getUser(c)
+app.get('/api/documents', requireAuth(), async (c) => {
+  const u = c.get('user')!
+  const rows = await c.env.DB.prepare(
+    `SELECT d.id, d.title, d.description, d.filename, d.file_type, d.mime_type, d.file_size,
+            d.uploaded_by, u2.name as uploaded_by_name, d.uploaded_at, d.is_public, d.download_count
+     FROM documents d
+     LEFT JOIN users u2 ON u2.id = d.uploaded_by
+     WHERE d.is_public = 1
+        OR d.uploaded_by = ?
+        OR ? = 'admin'
+        OR EXISTS (SELECT 1 FROM document_access a WHERE a.document_id = d.id AND a.user_id = ?)
+     ORDER BY d.uploaded_at DESC`
+  )
+    .bind(u.id, u.role, u.id)
+    .all<any>()
 
-  // Get all documents the user can access
-  const documents = await c.env.DB.prepare(`
-    SELECT DISTINCT d.*, u.name as uploader_name
-    FROM documents d
-    LEFT JOIN users u ON d.uploaded_by = u.id
-    LEFT JOIN document_access da ON d.id = da.document_id
-    WHERE d.is_public = 1
-       OR d.uploaded_by = ?
-       OR da.user_id = ?
-       OR ? = 'admin'
-       OR ? = 1
-    ORDER BY d.uploaded_at DESC
-  `).bind(user.id, user.id, user.role, user.can_view_all ? 1 : 0).all()
-
-  return c.json({ documents: documents.results })
+  return c.json({ documents: rows.results || [] })
 })
 
-app.post('/api/documents/upload', authMiddleware, async (c) => {
-  try {
-    const user = await getUser(c)
-    const formData = await c.req.formData()
+app.post('/api/documents/upload', requireAuth(), async (c) => {
+  const u = c.get('user')!
 
-    const file = formData.get('file') as File
-    const title = formData.get('title') as string
-    const description = formData.get('description') as string
-    const fileType = formData.get('fileType') as string
-    const isPublic = formData.get('isPublic') === 'true'
+  const body = await c.req.parseBody()
+  const file = body['file'] as File | undefined
+  if (!file) return jsonError('Missing file', 400)
 
-    if (!file) {
-      return c.json({ error: 'No file provided' }, 400)
-    }
+  const title = String(body['title'] || file.name).trim()
+  const description = String(body['description'] || '').trim()
+  const fileType = String(body['fileType'] || 'other').trim() // 'report' | 'spreadsheet' | 'other'
+  const isPublic = String(body['isPublic'] || '0') === '1' || String(body['isPublic'] || '').toLowerCase() === 'true'
 
-    // Generate unique file key
-    const fileKey = `uploads/${Date.now()}-${file.name}`
+  const bucket = getBucket(c.env)
+  const safeName = sanitizeFilename(file.name)
+  const key = `${Date.now()}-${crypto.randomUUID()}-${safeName}`
 
-    // Upload to R2
-    await c.env.FILES.put(fileKey, file.stream(), {
-      httpMetadata: {
-        contentType: file.type
-      }
-    })
+  const buf = await file.arrayBuffer()
+  await bucket.put(key, buf, {
+    httpMetadata: { contentType: file.type || 'application/octet-stream' },
+  })
 
-    // Save metadata to database
-    const result = await c.env.DB.prepare(`
-      INSERT INTO documents (title, description, filename, file_key, file_type, mime_type, file_size, uploaded_by, is_public)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      title || file.name,
-      description || '',
-      file.name,
-      fileKey,
+  const res = await c.env.DB.prepare(
+    `INSERT INTO documents
+      (title, description, filename, file_key, file_type, mime_type, file_size, uploaded_by, is_public, uploaded_at, download_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)`
+  )
+    .bind(
+      title,
+      description || null,
+      safeName,
+      key,
       fileType || 'other',
-      file.type,
-      file.size,
-      user.id,
+      file.type || null,
+      buf.byteLength,
+      u.id,
       isPublic ? 1 : 0
-    ).run()
+    )
+    .run()
 
-    // Log activity
-    await c.env.DB.prepare(
-      'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
-    ).bind(user.id, 'upload', result.meta.last_row_id, `Uploaded ${file.name}`).run()
+  const documentId = Number(res.meta.last_row_id)
+  await logActivity(c, u.id, 'upload', documentId, `Uploaded ${safeName}`)
 
-    return c.json({
-      success: true,
-      documentId: result.meta.last_row_id,
-      fileKey: fileKey
-    })
-  } catch (error: any) {
-    console.error('Upload error:', error)
-    return c.json({ error: error.message || 'Upload failed' }, 500)
-  }
+  return c.json({ success: true, documentId, fileKey: key })
 })
 
-app.get('/api/documents/:id/download', authMiddleware, async (c) => {
-  const user = await getUser(c)
-  const documentId = c.req.param('id')
+app.post('/api/documents/:id/share', requireAuth(), async (c) => {
+  const u = c.get('user')!
+  const docId = parseIntId(c.req.param('id'))
+  if (!docId) return jsonError('Invalid document id', 400)
 
-  // Check access permissions
-  const document = await c.env.DB.prepare(`
-    SELECT d.*,
-           (SELECT COUNT(*) FROM document_access WHERE document_id = d.id AND user_id = ?) as has_access
-    FROM documents d
-    WHERE d.id = ?
-  `).bind(user.id, documentId).first()
+  // owner or admin
+  const doc = await c.env.DB.prepare(`SELECT uploaded_by FROM documents WHERE id = ?`)
+    .bind(docId)
+    .first<any>()
+  if (!doc) return jsonError('Not found', 404)
 
-  if (!document) {
-    return c.json({ error: 'Document not found' }, 404)
-  }
+  if (u.role !== 'admin' && Number(doc.uploaded_by) !== u.id) return jsonError('Forbidden', 403)
 
-  // Check if user has access
-  const canAccess = document.is_public === 1 ||
-                    document.uploaded_by === user.id ||
-                    document.has_access > 0 ||
-                    user.role === 'admin' ||
-                    user.can_view_all
+  const body = await c.req.json().catch(() => null)
+  const targetUserId = Number(body?.userId)
+  if (!targetUserId) return jsonError('Missing userId', 400)
 
-  if (!canAccess) {
-    return c.json({ error: 'Access denied' }, 403)
-  }
-
-  // Get file from R2
-  const file = await c.env.FILES.get(document.file_key as string)
-  if (!file) {
-    return c.json({ error: 'File not found in storage' }, 404)
-  }
-
-  // Update download count
   await c.env.DB.prepare(
-    'UPDATE documents SET download_count = download_count + 1 WHERE id = ?'
-  ).bind(documentId).run()
+    `INSERT OR IGNORE INTO document_access (document_id, user_id, granted_by) VALUES (?, ?, ?)`
+  )
+    .bind(docId, targetUserId, u.id)
+    .run()
 
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
-  ).bind(user.id, 'download', documentId, `Downloaded ${document.filename}`).run()
+  await logActivity(c, u.id, 'share', docId, `Shared with user ${targetUserId}`)
+  return c.json({ success: true })
+})
 
-  return new Response(file.body, {
-    headers: {
-      'Content-Type': document.mime_type as string || 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${document.filename}"`,
-      'Content-Length': file.size.toString()
-    }
+app.delete('/api/documents/:id', requireAuth(), async (c) => {
+  const u = c.get('user')!
+  const docId = parseIntId(c.req.param('id'))
+  if (!docId) return jsonError('Invalid document id', 400)
+
+  const doc = await c.env.DB.prepare(`SELECT uploaded_by, file_key, filename FROM documents WHERE id = ?`)
+    .bind(docId)
+    .first<any>()
+  if (!doc) return jsonError('Not found', 404)
+
+  if (u.role !== 'admin' && Number(doc.uploaded_by) !== u.id) return jsonError('Forbidden', 403)
+
+  const bucket = getBucket(c.env)
+  await bucket.delete(String(doc.file_key))
+
+  await c.env.DB.prepare(`DELETE FROM document_access WHERE document_id = ?`).bind(docId).run()
+  await c.env.DB.prepare(`DELETE FROM documents WHERE id = ?`).bind(docId).run()
+
+  await logActivity(c, u.id, 'delete', docId, `Deleted ${doc.filename}`)
+  return c.json({ success: true })
+})
+
+/** ---------- Signed link endpoints (NEW) ---------- **/
+
+app.get('/api/documents/:id/view-link', requireAuth(), async (c) => {
+  const u = c.get('user')!
+  const docId = parseIntId(c.req.param('id'))
+  if (!docId) return jsonError('Invalid document id', 400)
+
+  const ok = await canAccessDocument(c, u.id, u.role, docId)
+  if (!ok) return jsonError('Forbidden', 403)
+
+  // 5 minutes is long enough for slow mobile opens, short enough for safety.
+  const token = await makeDocLinkToken(c.env, {
+    mode: 'view',
+    docId,
+    uid: u.id,
+    role: u.role,
+    exp: nowSec() + 60 * 5,
   })
+
+  const url = `${originFromReq(c.req.raw)}/api/documents/${docId}/view?t=${encodeURIComponent(token)}`
+  return c.json({ url })
 })
 
-app.get('/api/documents/:id/view', authMiddleware, async (c) => {
-  const user = await getUser(c)
-  const documentId = c.req.param('id')
+app.get('/api/documents/:id/download-link', requireAuth(), async (c) => {
+  const u = c.get('user')!
+  const docId = parseIntId(c.req.param('id'))
+  if (!docId) return jsonError('Invalid document id', 400)
 
-  // Check access permissions
-  const document = await c.env.DB.prepare(`
-    SELECT d.*,
-           (SELECT COUNT(*) FROM document_access WHERE document_id = d.id AND user_id = ?) as has_access
-    FROM documents d
-    WHERE d.id = ?
-  `).bind(user.id, documentId).first()
+  const ok = await canAccessDocument(c, u.id, u.role, docId)
+  if (!ok) return jsonError('Forbidden', 403)
 
-  if (!document) {
-    return c.json({ error: 'Document not found' }, 404)
-  }
-
-  // Check if user has access
-  const canAccess = document.is_public === 1 ||
-                    document.uploaded_by === user.id ||
-                    document.has_access > 0 ||
-                    user.role === 'admin' ||
-                    user.can_view_all
-
-  if (!canAccess) {
-    return c.json({ error: 'Access denied' }, 403)
-  }
-
-  // Get file from R2
-  const file = await c.env.FILES.get(document.file_key as string)
-  if (!file) {
-    return c.json({ error: 'File not found in storage' }, 404)
-  }
-
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
-  ).bind(user.id, 'view', documentId, `Viewed ${document.filename}`).run()
-
-  // Return file with inline content disposition to display in browser
-  return new Response(file.body, {
-    headers: {
-      'Content-Type': document.mime_type as string || 'application/pdf',
-      'Content-Disposition': `inline; filename="${document.filename}"`,
-      'Content-Length': file.size.toString()
-    }
+  const token = await makeDocLinkToken(c.env, {
+    mode: 'download',
+    docId,
+    uid: u.id,
+    role: u.role,
+    exp: nowSec() + 60 * 5,
   })
+
+  const url = `${originFromReq(c.req.raw)}/api/documents/${docId}/download?t=${encodeURIComponent(token)}`
+  return c.json({ url })
 })
 
-app.delete('/api/documents/:id', authMiddleware, async (c) => {
-  const user = await getUser(c)
-  const documentId = c.req.param('id')
+/** ---------- View / Download (UPDATED: supports ?t= signed token) ---------- **/
 
-  const document = await c.env.DB.prepare(
-    'SELECT * FROM documents WHERE id = ?'
-  ).bind(documentId).first()
-
-  if (!document) {
-    return c.json({ error: 'Document not found' }, 404)
+async function resolveAuthForDoc(c: any, docId: number, mode: 'view' | 'download') {
+  const token = c.req.query('t')
+  if (token) {
+    const p = await verifyDocLinkToken(c.env, token)
+    if (!p || p.docId !== docId || p.mode !== mode) return null
+    return { id: p.uid, role: p.role as UserRole, via: 'signed' as const }
   }
 
-  // Only owner or admin can delete
-  if (document.uploaded_by !== user.id && user.role !== 'admin') {
-    return c.json({ error: 'Access denied' }, 403)
+  const u = await getUserFromBearer(c)
+  if (!u) return null
+  return { id: u.id, role: u.role, via: 'bearer' as const }
+}
+
+function parseRangeHeader(rangeHeader: string | null, size: number): { start: number; end: number } | null {
+  if (!rangeHeader) return null
+  const m = rangeHeader.match(/bytes=(\d*)-(\d*)/i)
+  if (!m) return null
+  let start = m[1] ? Number(m[1]) : NaN
+  let end = m[2] ? Number(m[2]) : NaN
+
+  if (Number.isNaN(start) && !Number.isNaN(end)) {
+    // suffix bytes: "-500" means last 500 bytes
+    const suffix = end
+    if (!Number.isFinite(suffix) || suffix <= 0) return null
+    start = Math.max(0, size - suffix)
+    end = size - 1
+  } else if (!Number.isNaN(start) && Number.isNaN(end)) {
+    // "500-" means from 500 to end
+    end = size - 1
   }
 
-  // Delete from R2
-  await c.env.FILES.delete(document.file_key as string)
-
-  // Delete from database
-  await c.env.DB.prepare('DELETE FROM documents WHERE id = ?').bind(documentId).run()
-
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
-  ).bind(user.id, 'delete', `Deleted ${document.filename}`).run()
-
-  return c.json({ success: true })
-})
-
-// ==================================================
-// API Routes – Document Sharing
-// ==================================================
-
-// Share by user ID (any authenticated user can share)
-app.post('/api/documents/:id/share', authMiddleware, async (c) => {
-  const user = await getUser(c)
-  const documentId = c.req.param('id')
-  const { userId } = await c.req.json()
-
-  const document = await c.env.DB.prepare(
-    'SELECT * FROM documents WHERE id = ?'
-  ).bind(documentId).first()
-
-  if (!document) {
-    return c.json({ error: 'Document not found' }, 404)
-  }
-
-  // Anyone can share documents — no access check needed
-
-  // Grant access
-  await c.env.DB.prepare(
-    'INSERT OR REPLACE INTO document_access (document_id, user_id, granted_by) VALUES (?, ?, ?)'
-  ).bind(documentId, userId, user.id).run()
-
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, document_id, details) VALUES (?, ?, ?, ?)'
-  ).bind(user.id, 'share', documentId, `Shared with user ${userId}`).run()
-
-  return c.json({ success: true })
-})
-
-// Share document by email (create user if necessary and send Postmark notification)
-app.post('/api/documents/:id/share-by-email', authMiddleware, async (c) => {
-  try {
-    const user: any = await getUser(c)
-    if (!user) return c.json({ error: 'Unauthorized' }, 401)
-
-    const documentId = c.req.param('id')
-    const body = await c.req.json()
-    const email = (body?.email || '').toString().trim().toLowerCase()
-    const comment = (body?.comment || '').toString().trim()
-
-    if (!email) {
-      return c.json({ error: 'Email is required' }, 400)
-    }
-
-    // Get document
-    const doc: any = await c.env.DB.prepare(
-      'SELECT title, filename, uploaded_by FROM documents WHERE id = ?'
-    ).bind(documentId).first()
-
-    if (!doc) {
-      return c.json({ error: 'Document not found' }, 404)
-    }
-
-    // Look up recipient
-    let targetUser: any = await c.env.DB.prepare(
-      'SELECT id, email, name, force_password_reset FROM users WHERE email = ?'
-    ).bind(email).first()
-
-    let createdNewUser = false
-    let inviteLink: string | null = null
-
-    // If not a user, create a "pending" user and force a password set
-    if (!targetUser) {
-      createdNewUser = true
-      const tempPassword = crypto.randomUUID()
-      const tempHash = await hashPassword(tempPassword)
-
-      const createResult: any = await c.env.DB.prepare(
-        'INSERT INTO users (email, password_hash, name, role, force_password_reset, can_view_all) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind(email, tempHash, email.split('@')[0] || 'User', 'member', 1, 0).run()
-
-      const newUserId = createResult.meta.last_row_id
-      targetUser = { id: newUserId, email, name: email.split('@')[0] || 'User', force_password_reset: 1 }
-    }
-
-    // Grant access (idempotent)
-    await c.env.DB.prepare(
-      'INSERT OR IGNORE INTO document_access (document_id, user_id, granted_by) VALUES (?, ?, ?)'
-    ).bind(documentId, targetUser.id, user.id).run()
-
-    // Create an invite token (for new users, or if they are flagged to reset)
-    const needsPasswordSet = createdNewUser || targetUser.force_password_reset === 1
-    if (needsPasswordSet) {
-      const token = crypto.randomUUID()
-      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString() // 7 days
-      const type = createdNewUser ? 'invite' : 'reset'
-
-      await c.env.DB.prepare(
-        'INSERT INTO user_invites (user_id, token, type, expires_at, created_by) VALUES (?, ?, ?, ?, ?)'
-      ).bind(targetUser.id, token, type, expiresAt, user.id).run()
-
-      const origin = new URL(c.req.url).origin
-      inviteLink = `${origin}/set-password?token=${encodeURIComponent(token)}`
-    }
-
-    // Log activity (include comment if provided)
-    await c.env.DB.prepare(`
-      INSERT INTO activity_log (user_id, action, document_id, details, ip_address, user_agent)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      user.id,
-      'share',
-      documentId,
-      JSON.stringify({
-        sharedWith: email,
-        documentTitle: doc.title,
-        comment: comment || null,
-        invited: !!inviteLink
-      }),
-      c.req.header('CF-Connecting-IP') || '',
-      c.req.header('User-Agent') || ''
-    ).run()
-
-    // Send Postmark email (if configured)
-    const postmarkToken = c.env.POSTMARK_SERVER_TOKEN
-    const fromEmail = c.env.POSTMARK_FROM_EMAIL || 'admin@telosap4p.com'
-    const origin = new URL(c.req.url).origin
-
-    if (postmarkToken) {
-      const subject = 'A document has been shared with you in the Telosa P4P repository'
-
-      const commentBlock = comment
-        ? `
-
-Message from ${user.email}:
-${comment}
-`
-        : ''
-
-      const accessBlock = inviteLink
-        ? `
-
-To access the repository, please set your password using this secure link (valid for 7 days):
-${inviteLink}
-`
-        : `
-
-You can log in at ${origin}/ to view the file.
-`
-
-      const textBody =
-        `Hello,
-
-` +
-        `${user.email} has shared a document with you in the Telosa P4P repository.
-
-` +
-        `Document Title: ${doc.title}
-` +
-        commentBlock +
-        accessBlock +
-        `
-– Telosa P4P Document Repository
-`
-
-      const postmarkResponse = await fetch('https://api.postmarkapp.com/email', {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          'X-Postmark-Server-Token': postmarkToken
-        },
-        body: JSON.stringify({
-          From: fromEmail,
-          To: email,
-          Subject: subject,
-          TextBody: textBody,
-          ReplyTo: user.email
-        })
-      })
-
-      if (!postmarkResponse.ok) {
-        const errorText = await postmarkResponse.text()
-        console.error('Postmark send failed:', errorText)
-      }
-    } else {
-      console.warn('POSTMARK_SERVER_TOKEN not set; skipping email send')
-    }
-
-    return c.json({
-      success: true,
-      message: inviteLink
-        ? `Shared successfully. An invite link was emailed to ${email}.`
-        : `Shared successfully. A notification email was sent to ${email}.`
-    })
-  } catch (error) {
-    console.error('Share by email error:', error)
-    return c.json({ error: 'Share failed' }, 500)
-  }
-})
-
-
-// ==================================================
-// API Routes – Users (Admin only)
-// ==================================================
-app.get('/api/users', authMiddleware, async (c) => {
-  const user = await getUser(c)
-
-  if (user.role !== 'admin') {
-    return c.json({ error: 'Admin access required' }, 403)
-  }
-
-  const users = await c.env.DB.prepare(
-    'SELECT id, email, name, role, can_view_all, force_password_reset, created_at, last_login FROM users ORDER BY created_at DESC'
-  ).all()
-
-  return c.json({ users: users.results })
-})
-
-// Create new user (Admin only)
-app.post('/api/users', authMiddleware, async (c) => {
-  const user = await getUser(c)
-
-  if (user.role !== 'admin') {
-    return c.json({ error: 'Admin access required' }, 403)
-  }
-
-  const { email, password, name, role, can_view_all } = await c.req.json()
-
-  // Validate required fields
-  if (!email || !password || !name) {
-    return c.json({ error: 'Email, password, and name are required' }, 400)
-  }
-
-  // Check if user already exists
-  const existing = await c.env.DB.prepare(
-    'SELECT id FROM users WHERE email = ?'
-  ).bind(email).first()
-
-  if (existing) {
-    return c.json({ error: 'Email already registered' }, 400)
-  }
-
-  const passwordHash = await hashPassword(password)
-
-  const result = await c.env.DB.prepare(
-    'INSERT INTO users (email, password_hash, name, role, can_view_all) VALUES (?, ?, ?, ?, ?)'
-  ).bind(email, passwordHash, name, role || 'member', can_view_all ? 1 : 0).run()
-
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
-  ).bind(user.id, 'user_create', `Created user ${email}`).run()
-
-  return c.json({ success: true, userId: result.meta.last_row_id })
-})
-
-// Update user (Admin only)
-app.put('/api/users/:id', authMiddleware, async (c) => {
-  const user = await getUser(c)
-  const userId = c.req.param('id')
-
-  if (user.role !== 'admin') {
-    return c.json({ error: 'Admin access required' }, 403)
-  }
-
-  const { email, name, role, password, can_view_all } = await c.req.json()
-
-  // Check if user exists
-  const existingUser = await c.env.DB.prepare(
-    'SELECT id FROM users WHERE id = ?'
-  ).bind(userId).first()
-
-  if (!existingUser) {
-    return c.json({ error: 'User not found' }, 404)
-  }
-
-  // Check if email is already used by another user
-  if (email) {
-    const emailCheck = await c.env.DB.prepare(
-      'SELECT id FROM users WHERE email = ? AND id != ?'
-    ).bind(email, userId).first()
-
-    if (emailCheck) {
-      return c.json({ error: 'Email already in use' }, 400)
-    }
-  }
-
-  // Build update query dynamically
-  const updates: string[] = []
-  const bindings: any[] = []
-
-  if (email) {
-    updates.push('email = ?')
-    bindings.push(email)
-  }
-  if (name) {
-    updates.push('name = ?')
-    bindings.push(name)
-  }
-  if (role) {
-    updates.push('role = ?')
-    bindings.push(role)
-  }
-  if (can_view_all !== undefined) {
-    updates.push('can_view_all = ?')
-    bindings.push(can_view_all ? 1 : 0)
-  }
-  if (password) {
-    const passwordHash = await hashPassword(password)
-    updates.push('password_hash = ?')
-    bindings.push(passwordHash)
-  }
-
-  if (updates.length === 0) {
-    return c.json({ error: 'No fields to update' }, 400)
-  }
-
-  bindings.push(userId)
-
-  await c.env.DB.prepare(
-    `UPDATE users SET ${updates.join(', ')} WHERE id = ?`
-  ).bind(...bindings).run()
-
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
-  ).bind(user.id, 'user_update', `Updated user ${userId}`).run()
-
-  return c.json({ success: true })
-})
-
-// Delete user (Admin only)
-app.delete('/api/users/:id', authMiddleware, async (c) => {
-  const user = await getUser(c)
-  const userId = c.req.param('id')
-
-  if (user.role !== 'admin') {
-    return c.json({ error: 'Admin access required' }, 403)
-  }
-
-  // Prevent admin from deleting themselves
-  if (parseInt(userId) === user.id) {
-    return c.json({ error: 'Cannot delete your own account' }, 400)
-  }
-
-  // Check if user exists
-  const existingUser = await c.env.DB.prepare(
-    'SELECT id, email FROM users WHERE id = ?'
-  ).bind(userId).first()
-
-  if (!existingUser) {
-    return c.json({ error: 'User not found' }, 404)
-  }
-
-  // Delete user (CASCADE will handle related records)
-  await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run()
-
-  // Log activity
-  await c.env.DB.prepare(
-    'INSERT INTO activity_log (user_id, action, details) VALUES (?, ?, ?)'
-  ).bind(user.id, 'user_delete', `Deleted user ${existingUser.email}`).run()
-
-  return c.json({ success: true })
-})
-
-// ==================================================
-// API Routes – Activity Log
-// ==================================================
-app.get('/api/activity', authMiddleware, async (c) => {
-  const user = await getUser(c)
-
-  let query = 'SELECT al.*, u.name as user_name, d.title as document_title FROM activity_log al LEFT JOIN users u ON al.user_id = u.id LEFT JOIN documents d ON al.document_id = d.id'
-
-  if (user.role === 'admin') {
-    query += ' ORDER BY al.created_at DESC LIMIT 100'
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  if (start < 0 || end < start || start >= size) return null
+  end = Math.min(end, size - 1)
+  return { start, end }
+}
+
+async function serveDocBinary(
+  c: any,
+  docId: number,
+  disposition: 'inline' | 'attachment',
+  authUserId: number,
+  authRole: UserRole,
+  logAction: 'view' | 'download'
+) {
+  const ok = await canAccessDocument(c, authUserId, authRole, docId)
+  if (!ok) return jsonError('Forbidden', 403)
+
+  const doc = await getDocumentRow(c, docId)
+  if (!doc) return jsonError('Not found', 404)
+
+  const bucket = getBucket(c.env)
+  const key = String(doc.file_key)
+  const head = await bucket.head(key)
+  if (!head) return jsonError('File missing in storage', 500)
+
+  const size = Number(head.size)
+  const range = parseRangeHeader(c.req.header('Range') || c.req.header('range') || null, size)
+
+  // R2 range fetch (if requested)
+  let obj: R2ObjectBody | null = null
+  let status = 200
+  const headers = new Headers()
+
+  headers.set('Content-Type', String(doc.mime_type || head.httpMetadata?.contentType || 'application/octet-stream'))
+  headers.set('Content-Disposition', `${disposition}; filename="${sanitizeFilename(String(doc.filename || 'document'))}"`)
+  headers.set('Accept-Ranges', 'bytes')
+  headers.set('Cache-Control', 'private, no-store, max-age=0')
+
+  if (range) {
+    const length = range.end - range.start + 1
+    obj = await bucket.get(key, { range: { offset: range.start, length } })
+    if (!obj) return jsonError('File missing in storage', 500)
+    status = 206
+    headers.set('Content-Range', `bytes ${range.start}-${range.end}/${size}`)
+    headers.set('Content-Length', String(length))
   } else {
-    query += ' WHERE al.user_id = ? ORDER BY al.created_at DESC LIMIT 50'
+    obj = await bucket.get(key)
+    if (!obj) return jsonError('File missing in storage', 500)
+    headers.set('Content-Length', String(size))
   }
 
-  const stmt = user.role === 'admin'
-    ? c.env.DB.prepare(query)
-    : c.env.DB.prepare(query).bind(user.id)
+  // Update stats/logs
+  if (logAction === 'download') {
+    await c.env.DB.prepare(`UPDATE documents SET download_count = download_count + 1 WHERE id = ?`)
+      .bind(docId)
+      .run()
+  }
+  await logActivity(c, authUserId, logAction, docId)
 
-  const logs = await stmt.all()
+  return new Response(obj.body, { status, headers })
+}
 
-  return c.json({ activities: logs.results })
+app.get('/api/documents/:id/view', async (c) => {
+  const docId = parseIntId(c.req.param('id'))
+  if (!docId) return jsonError('Invalid document id', 400)
+
+  const auth = await resolveAuthForDoc(c, docId, 'view')
+  if (!auth) return jsonError('Unauthorized', 401)
+
+  return serveDocBinary(c, docId, 'inline', auth.id, auth.role, 'view')
 })
 
-// ==================================================
-// API Routes – External Database (Placeholder)
-// ==================================================
-app.post('/api/external/query', authMiddleware, async (c) => {
-  const user = await getUser(c)
+app.get('/api/documents/:id/download', async (c) => {
+  const docId = parseIntId(c.req.param('id'))
+  if (!docId) return jsonError('Invalid document id', 400)
 
-  if (user.role !== 'admin') {
-    return c.json({ error: 'Admin access required' }, 403)
-  }
+  const auth = await resolveAuthForDoc(c, docId, 'download')
+  if (!auth) return jsonError('Unauthorized', 401)
 
-  const { query, params } = await c.req.json()
+  return serveDocBinary(c, docId, 'attachment', auth.id, auth.role, 'download')
+})
 
-  // Placeholder – connect to your IONOS VPS database here
+/** ---------- Users (admin) ---------- **/
 
-  return c.json({
-    message: 'External database integration endpoint',
-    note: 'Configure your IONOS VPS API endpoint here'
+app.get('/api/users', requireAuth(), requireAdmin(), async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT id, email, name, role, created_at, last_login FROM users ORDER BY created_at DESC`
+  ).all<any>()
+
+  return c.json({ users: rows.results || [] })
+})
+
+/** ---------- Activity ---------- **/
+
+app.get('/api/activity', requireAuth(), async (c) => {
+  const u = c.get('user')!
+  const rows =
+    u.role === 'admin'
+      ? await c.env.DB.prepare(
+          `SELECT a.*, u.name as user_name
+           FROM activity_log a
+           LEFT JOIN users u ON u.id = a.user_id
+           ORDER BY a.created_at DESC
+           LIMIT 500`
+        ).all<any>()
+      : await c.env.DB.prepare(
+          `SELECT a.*
+           FROM activity_log a
+           WHERE a.user_id = ?
+           ORDER BY a.created_at DESC
+           LIMIT 500`
+        )
+          .bind(u.id)
+          .all<any>()
+
+  return c.json({ activities: rows.results || [] })
+})
+
+/** ---------- External DB Integration (admin) ---------- **/
+
+app.post('/api/external/query', requireAuth(), requireAdmin(), async (c) => {
+  const url = c.env.IONOS_QUERY_URL
+  const apiKey = c.env.IONOS_API_KEY
+  if (!url || !apiKey) return jsonError('IONOS integration not configured', 501)
+
+  const body = await c.req.json().catch(() => null)
+  if (!body?.query) return jsonError('Missing query', 400)
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ query: body.query, params: body.params || [] }),
   })
-})
 
-
-// Set-password landing page (invite/reset)
-app.get('/set-password', async (c) => {
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Set Password – Telosa P4P</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:#f3f4f6; margin:0; }
-    .wrap { max-width: 520px; margin: 64px auto; padding: 0 16px; }
-    .card { background:#fff; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,.08); padding: 28px; }
-    h1 { font-size: 20px; margin: 0 0 6px; color:#111827; }
-    p { margin: 0 0 18px; color:#4b5563; line-height: 1.5; }
-    label { display:block; font-size: 12px; font-weight: 600; color:#374151; margin: 12px 0 6px; }
-    input { width:100%; padding: 10px 12px; border:1px solid #d1d5db; border-radius: 10px; font-size: 14px; }
-    input:focus { outline:none; border-color:#3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }
-    button { width:100%; margin-top: 14px; padding: 10px 12px; border: none; border-radius: 10px; background:#111827; color:#fff; font-weight: 700; cursor:pointer; }
-    button:disabled { opacity:.6; cursor:not-allowed; }
-    .msg { margin-top: 12px; font-size: 13px; }
-    .msg.ok { color:#065f46; }
-    .msg.err { color:#991b1b; }
-    .link { display:block; margin-top: 14px; text-align:center; font-size: 13px; color:#1f2937; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1>Set your password</h1>
-      <p>Create a password to access the Telosa P4P Document Repository.</p>
-
-      <form id="form">
-        <label for="pw1">New password</label>
-        <input id="pw1" type="password" minlength="8" required placeholder="Minimum 8 characters" />
-
-        <label for="pw2">Confirm password</label>
-        <input id="pw2" type="password" minlength="8" required placeholder="Re-enter password" />
-
-        <button id="btn" type="submit">Set password</button>
-        <div id="msg" class="msg"></div>
-      </form>
-
-      <a class="link" href="/">Return to login</a>
-    </div>
-  </div>
-
-  <script>
-    const params = new URLSearchParams(location.search);
-    const token = params.get('token') || '';
-    const form = document.getElementById('form');
-    const btn = document.getElementById('btn');
-    const msg = document.getElementById('msg');
-
-    function setMsg(text, ok) {
-      msg.textContent = text;
-      msg.className = 'msg ' + (ok ? 'ok' : 'err');
-    }
-
-    if (!token) {
-      setMsg('Missing token. Please use the link from your email.', false);
-      btn.disabled = true;
-    }
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (!token) return;
-
-      const pw1 = document.getElementById('pw1').value;
-      const pw2 = document.getElementById('pw2').value;
-
-      if (pw1.length < 8) return setMsg('Password must be at least 8 characters.', false);
-      if (pw1 !== pw2) return setMsg('Passwords do not match.', false);
-
-      btn.disabled = true;
-      btn.textContent = 'Saving...';
-
-      try {
-        const res = await fetch('/api/auth/set-password', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, password: pw1 })
-        });
-
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          setMsg(data.error || 'Failed to set password.', false);
-          btn.disabled = false;
-          btn.textContent = 'Set password';
-          return;
-        }
-
-        setMsg('Password set successfully. You can now log in.', true);
-        btn.textContent = 'Done';
-      } catch (err) {
-        setMsg('Network error. Please try again.', false);
-        btn.disabled = false;
-        btn.textContent = 'Set password';
-      }
-    });
-  </script>
-</body>
-</html>`
-  return c.html(html)
-})
-
-
-// ==================================================
-// Frontend Routes – serve the SPA shell
-// ==================================================
-
-app.get('/', (c) => {
-  return c.html(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Telosa P4P - Document Repository</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
-    </head>
-    <body class="bg-gray-50">
-        <div id="app"></div>
-
-        <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-        <script src="/static/app.js"></script>
-    </body>
-    </html>
-  `)
+  const data = await res.json().catch(() => ({}))
+  return c.json(data, res.status)
 })
 
 export default app
