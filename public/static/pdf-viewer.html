@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Loading PDF…</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: rgba(255,255,255,0.06);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.65);
+      --line: rgba(255,255,255,0.12);
+      --accent: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+
+    .topbar {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(0,0,0,0.25);
+      backdrop-filter: blur(10px);
+    }
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+    .brand .logo {
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      white-space: nowrap;
+    }
+    .brand .title {
+      font-size: 13px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 60vw;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .wrap {
+      height: calc(100% - 56px);
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .status {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,0.03);
+    }
+    .statusRow {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      flex: 0 0 auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .statusText {
+      font-size: 14px;
+      color: var(--text);
+    }
+    .subText {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .progressWrap {
+      margin-top: 10px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.10);
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.10);
+      max-width: 520px;
+    }
+    .progressBar {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 150ms linear;
+    }
+
+    .viewer {
+      height: 100%;
+      width: 100%;
+      background: #111827;
+      position: relative;
+    }
+    iframe {
+      border: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+      background: #111827;
+    }
+    .error {
+      display: none;
+      padding: 14px;
+      color: #fecaca;
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.25);
+      margin: 14px;
+      border-radius: 12px;
+    }
+    a.inlineLink { color: #93c5fd; text-decoration: none; }
+    a.inlineLink:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">Telosa P4P</div>
+      <div id="docTitle" class="title">Preparing document…</div>
+    </div>
+    <div class="actions">
+      <button id="downloadBtn" disabled>Download</button>
+      <button id="openBtn" disabled>Open PDF Direct</button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="status" id="statusPanel">
+      <div class="statusRow">
+        <div class="spinner" id="spinner"></div>
+        <div class="statusText" id="statusText">Loading…</div>
+      </div>
+      <div class="subText" id="subText">If this is a large PDF, it can take a moment on mobile devices.</div>
+      <div class="progressWrap" id="progressWrap">
+        <div class="progressBar" id="progressBar"></div>
+      </div>
+    </div>
+
+    <div class="viewer">
+      <div class="error" id="errorBox"></div>
+      <iframe id="pdfFrame" title="PDF Viewer"></iframe>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const docTitleEl = document.getElementById('docTitle');
+      const statusPanel = document.getElementById('statusPanel');
+      const statusText = document.getElementById('statusText');
+      const subText = document.getElementById('subText');
+      const progressWrap = document.getElementById('progressWrap');
+      const progressBar = document.getElementById('progressBar');
+      const errorBox = document.getElementById('errorBox');
+      const iframe = document.getElementById('pdfFrame');
+      const downloadBtn = document.getElementById('downloadBtn');
+      const openBtn = document.getElementById('openBtn');
+
+      const params = new URLSearchParams(location.search);
+      const docId = params.get('docId');
+      const hintedTitle = params.get('title');
+
+      if (hintedTitle) {
+        docTitleEl.textContent = hintedTitle;
+        document.title = hintedTitle;
+      }
+
+      function showError(msg) {
+        statusText.textContent = 'Unable to open PDF';
+        subText.textContent = '';
+        progressWrap.style.display = 'none';
+        errorBox.style.display = 'block';
+        errorBox.innerHTML = msg;
+        document.getElementById('spinner').style.display = 'none';
+      }
+
+      // Try multiple likely token keys to avoid breaking your existing auth storage.
+      function getBearerToken() {
+        const keys = [
+          'token',
+          'authToken',
+          'jwt',
+          'access_token',
+          'accessToken',
+          'telosa_token',
+          'telosaToken'
+        ];
+
+        // localStorage first
+        try {
+          for (const k of keys) {
+            const v = localStorage.getItem(k);
+            if (v && v.trim()) return v.trim();
+          }
+        } catch (e) {}
+
+        // sessionStorage fallback
+        try {
+          for (const k of keys) {
+            const v = sessionStorage.getItem(k);
+            if (v && v.trim()) return v.trim();
+          }
+        } catch (e) {}
+
+        return null;
+      }
+
+      if (!docId) {
+        showError('Missing <b>docId</b>. This viewer must be opened from the Documents table.');
+        return;
+      }
+
+      const token = getBearerToken();
+      if (!token) {
+        showError(
+          'No login token found in this browser. Please <a class="inlineLink" href="/">log in</a> again, then re-open the PDF.'
+        );
+        return;
+      }
+
+      const apiUrl = `/api/documents/${encodeURIComponent(docId)}/view`;
+
+      // Provide a direct-open option (may 401 if your API requires Authorization headers)
+      openBtn.disabled = false;
+      openBtn.addEventListener('click', () => {
+        window.open(apiUrl, '_blank', 'noopener,noreferrer');
+      });
+
+      let objectUrl = null;
+      window.addEventListener('beforeunload', () => {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      });
+
+      async function fetchPdfWithProgress(url, bearer) {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${bearer}` },
+          // keep same-origin cookies behavior consistent if you ever add cookies later:
+          credentials: 'same-origin'
+        });
+
+        if (!res.ok) {
+          const txt = await res.text().catch(() => '');
+          throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? ` — ${txt}` : ''}`);
+        }
+
+        const cd = res.headers.get('content-disposition') || '';
+        let filename = `document-${docId}.pdf`;
+        const m = cd.match(/filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)\"?/i);
+        if (m) filename = decodeURIComponent((m[1] || m[2] || filename).trim());
+
+        const total = parseInt(res.headers.get('content-length') || '0', 10);
+        if (!res.body || !res.body.getReader) {
+          // Fallback (older browsers / iOS edge cases)
+          const blob = await res.blob();
+          return { blob, filename };
+        }
+
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+
+        statusText.textContent = 'Downloading PDF…';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.byteLength;
+
+          if (total > 0) {
+            const pct = Math.min(100, Math.round((received / total) * 100));
+            progressBar.style.width = pct + '%';
+            subText.textContent = `Downloaded ${pct}%`;
+          } else {
+            // If content-length isn’t available, show an “indeterminate-ish” progress
+            const kb = Math.round(received / 1024);
+            subText.textContent = `Downloaded ${kb} KB…`;
+            progressBar.style.width = '35%';
+          }
+        }
+
+        progressBar.style.width = '100%';
+        subText.textContent = 'Opening PDF…';
+
+        const blob = new Blob(chunks, { type: 'application/pdf' });
+        return { blob, filename };
+      }
+
+      (async () => {
+        try {
+          docTitleEl.textContent = hintedTitle ? hintedTitle : `Document #${docId}`;
+          document.title = hintedTitle ? hintedTitle : `Document ${docId}`;
+
+          const { blob, filename } = await fetchPdfWithProgress(apiUrl, token);
+
+          objectUrl = URL.createObjectURL(blob);
+
+          // Enable download button
+          downloadBtn.disabled = false;
+          downloadBtn.addEventListener('click', () => {
+            const a = document.createElement('a');
+            a.href = objectUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          });
+
+          // Show PDF
+          iframe.src = objectUrl;
+          iframe.style.display = 'block';
+
+          statusText.textContent = 'Loaded';
+          subText.textContent = filename;
+          setTimeout(() => {
+            statusPanel.style.display = 'none';
+          }, 300);
+
+        } catch (err) {
+          showError(
+            `<b>PDF load failed.</b><br/><br/>${String(err && err.message ? err.message : err)}`
+          );
+        }
+      })();
+    })();
+  </script>
+</body>
+</html>
